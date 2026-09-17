@@ -1968,7 +1968,27 @@ contains
   !> function for lattice vector inr in cell grid fout. This version
   !> works on its own (c.f. get_qe_wnr) and is therefore slower. omega
   !> is the cell volume (used for normalization).
-  module subroutine get_qe_wnr_standalone(f,omega,ibnd,ispin,inr,rotate,fout,ti)
+  !>
+  !> fout may be larger than the field's own grid (f%n), as long as its
+  !> size in each direction is an integer multiple of f%n: this requests
+  !> the Wannier function on a box spanning several periodic copies of
+  !> the cell (e.g. 2*f%n for a 2x2x2-cell box), at the same resolution.
+  !> This is NOT the same as tiling a single-cell result: the periodic
+  !> part u_k(r) (period = one field cell) is looked up wrapped, but the
+  !> phase e(ik.(r-R)) uses the true, unwrapped coordinate, so the actual
+  !> (generally non-periodic, decaying) shape of the Wannier function is
+  !> recovered beyond the first cell instead of an aliased repeat of it.
+  !> No extra FFTs are needed for this -- same cost as the single-cell case.
+  !>
+  !> ioffset (optional, default 0 0 0) is the grid-point index (in units of
+  !> f%n, i.e. whole cells) that fout(1,1,1) corresponds to; e.g. ioffset =
+  !> -f%n centers a 3*f%n-sized fout on the home cell instead of starting
+  !> the box there. Without this, fout(1,1,1) is ALWAYS fractional-cell
+  !> origin 0, regardless of how fout is later labelled/positioned by the
+  !> caller (e.g. in a cube file's declared origin) -- a mismatch between
+  !> the two silently shifts the recovered orbital by whole cells relative
+  !> to where it is drawn.
+  module subroutine get_qe_wnr_standalone(f,omega,ibnd,ispin,inr,rotate,fout,ioffset,ti)
     use tools_io, only: fopen_read, fopen_scratch, fclose, ferror, faterr
     use param, only: tpi, img
     class(grid3), intent(in) :: f
@@ -1978,14 +1998,21 @@ contains
     integer, intent(in) :: inr(3)
     logical, intent(in) :: rotate
     complex*16, intent(out) :: fout(:,:,:)
+    integer, intent(in), optional :: ioffset(3)
     type(thread_info), intent(in), optional :: ti
 
     integer :: i, j, k, is, ik, jbnd, luc, ireg
-    complex*16, allocatable :: evcaux(:), evc(:,:), rseq(:), raux(:,:,:)
+    integer :: nout(3), ioff(3), iw, jw, kw
+    complex*16, allocatable :: evcaux(:), evc(:,:), rseq(:), raux(:,:,:), fk(:,:,:)
+    complex*16 :: phase
+
+    nout = (/size(fout,1),size(fout,2),size(fout,3)/)
+    ioff = 0
+    if (present(ioffset)) ioff = ioffset * f%n
 
     ! some checks
-    if (f%n(1) /= size(fout,1).or.f%n(2) /= size(fout,2).or.f%n(3) /= size(fout,3)) &
-       call ferror("get_qe_wnr_standalone","inconsistent grid size",faterr)
+    if (any(mod(nout,f%n) /= 0)) &
+       call ferror("get_qe_wnr_standalone","output grid size must be an integer multiple of the field grid",faterr)
     if (any(abs(f%qe%wk - f%qe%wk(1)) > 1d-5)) &
        call ferror("get_qe_wnr_standalone","wannier transformation only possible with uniform grids (no symmetry)",faterr)
 
@@ -2027,39 +2054,51 @@ contains
     ! allocate auxiliary arrays
     allocate(rseq(f%n(1)*f%n(2)*f%n(3)))
     allocate(raux(f%n(1),f%n(2),f%n(3)))
+    allocate(fk(nout(1),nout(2),nout(3)))
     rseq = 0d0
     raux = 0d0
     fout = 0d0
 
-    !$omp parallel do firstprivate(rseq,raux)
+    !$omp parallel do firstprivate(rseq,raux,fk) private(i,j,k,iw,jw,kw,phase)
     do ik = 1, f%qe%nks
-       ! calculate unk(r) as FT of the coefficients
+       ! calculate unk(r) as FT of the coefficients (periodic, one field-cell grid)
        rseq = 0d0
        rseq(f%qe%nl(f%qe%igk_k(1:f%qe%ngk(ik),ik))) = evc(1:f%qe%ngk(ik),ik)
        raux = reshape(rseq,shape(raux))
        call cfftnd(3,f%n,+1,raux)
 
-       ! multiply by the phase factor (e(ik*r))
-       do k = 1, f%n(3)
-          do j = 1, f%n(2)
-             do i = 1, f%n(1)
-                raux(i,j,k) = raux(i,j,k) * exp(tpi*img*(f%qe%kpt(1,ik)*real(i-1,8)/real(f%n(1),8)+&
-                   f%qe%kpt(2,ik)*real(j-1,8)/real(f%n(2),8)+f%qe%kpt(3,ik)*real(k-1,8)/real(f%n(3),8)))
+       ! accumulate onto the (possibly multi-cell) output grid: u_k(r) is
+       ! looked up wrapped (period = f%n), but the combined phase e(ik.(r-R))
+       ! uses the unwrapped fractional coordinate, so a lattice copy beyond
+       ! the first cell gets the true Wannier tail there, not an aliased
+       ! repeat of the first cell.
+       ! ii/jj/kk (0-based, can be negative) are the true grid position of
+       ! fout(i,j,k), i.e. fout(1,1,1) sits at ioff, not at 0 -- modulo (not
+       ! mod) is required here since ioff can be negative and modulo always
+       ! returns a result of the same sign as f%n (i.e. in [0,f%n)), unlike
+       ! mod which would return a negative wrapped index for negative input
+       do k = 1, nout(3)
+          kw = modulo(k-1+ioff(3),f%n(3)) + 1
+          do j = 1, nout(2)
+             jw = modulo(j-1+ioff(2),f%n(2)) + 1
+             do i = 1, nout(1)
+                iw = modulo(i-1+ioff(1),f%n(1)) + 1
+                phase = exp(tpi*img*(f%qe%kpt(1,ik)*(real(i-1+ioff(1),8)/real(f%n(1),8)-inr(1)) +&
+                   f%qe%kpt(2,ik)*(real(j-1+ioff(2),8)/real(f%n(2),8)-inr(2)) +&
+                   f%qe%kpt(3,ik)*(real(k-1+ioff(3),8)/real(f%n(3),8)-inr(3))))
+                fk(i,j,k) = raux(iw,jw,kw) * phase
              end do
           end do
        end do
 
-       ! the phase factor for this lattice vector (e(-ik*R))
-       raux = raux * exp(-tpi*img*(f%qe%kpt(1,ik)*inr(1)+f%qe%kpt(2,ik)*inr(2)+f%qe%kpt(3,ik)*inr(3)))
-
        !$omp critical (sum)
-       fout = fout + raux
+       fout = fout + fk
        !$omp end critical (sum)
     end do
     !$omp end parallel do
 
     ! cleanup
-    deallocate(rseq,raux)
+    deallocate(rseq,raux,fk)
 
     ! normalize
     fout = fout / real(f%qe%nks,8) / sqrt(omega)

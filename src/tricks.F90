@@ -35,6 +35,8 @@ module tricks
   private :: trick_force_constants
   private :: trick_average_electron_energy
   private :: trick_calculate_displacements
+  private :: trick_nados
+  private :: trick_psinknorm
 
 contains
 
@@ -66,6 +68,10 @@ contains
        call trick_average_electron_energy(line0(lp:))
     else if (equal(word,'displacements')) then
        call trick_calculate_displacements(line0(lp:))
+    else if (equal(word,'nados')) then
+       call trick_nados(line0(lp:))
+    else if (equal(word,'psinknorm')) then
+       call trick_psinknorm(line0(lp:))
     else
        call ferror('trick','Unknown keyword: ' // trim(word),faterr,line0,syntax=.true.)
        return
@@ -3458,5 +3464,788 @@ contains
     end if
 
   end subroutine trick_calculate_displacements
+
+  !> TRICK NADOS idA [ixA iyA izA] idB [ixB iyB izB] [FIELD fieldid]
+  !>             [BASIN fieldid] [BOX nx ny nz] [SUPERBOX nx ny nz]
+  !>             [BANDS n1 n2 ...] [OCCMIN thr.r] [MAXNADO n.i] [PREFIX name]
+  !>             [NOROTATE] [YT] [PSINK] [WANCUT cutoff.r]
+  !>
+  !> WANCUT (Wannier mode only, default off = plain BOX enumeration) makes
+  !> the (band,translation) orbital search adaptive, mirroring critic2's
+  !> own calc_sij_wannier/DELOC cutoff exactly: a candidate is kept only if
+  !> spread(band)*cutoff > distance(its Wannier centre, basin A or B) --
+  !> i.e. only if its centre is plausibly close enough to either basin to
+  !> matter. BOX is still the outer enumeration bound (so the search stays
+  !> finite), but with WANCUT most of that box is skipped before ever
+  !> calling the expensive per-orbital build, so BOX can be set much larger
+  !> than would otherwise be affordable -- reaching as far as any given
+  !> band's own spread actually warrants, rather than paying a uniform
+  !> (2*BOX+1)^3 cost for every band regardless of need.
+  !>
+  !> PSINK switches the orbital basis from (band,lattice-translation)
+  !> Wannier functions to (band,k-point) Bloch states, each weighted by
+  !> sqrt(occ(band,kpt,spin)/fspin) -- the only choice that is physically
+  !> correct for a METAL, where occupation varies across the Fermi surface
+  !> (i.e. with k, at fixed band) and so cannot be attributed to a single
+  !> real-space Wannier function the way the default basis assumes (which
+  !> implicitly takes every included band as occ=fspin, exactly like
+  !> critic2's own calc_fa_wannier). No .chk/wannier90 step or ROTATE/BOX
+  !> is needed or used with PSINK: the full k-point mesh already covers the
+  !> crystal's periodicity exactly, with no lattice-translation search or
+  !> truncation. SUPERBOX is not supported yet in this mode.
+  !>
+  !> YT selects Yu-Trinkle integration for the basin partition instead of
+  !> the default Bader (Henkelman et al.) one. Unlike Bader's hard 0/1
+  !> partition, YT gives a fractional weight per grid point (in [0,1],
+  !> shared between basins near a boundary); S^A, S^B are built as
+  !> sum_r wA(r)*conj(orb_i(r))*orb_j(r), which reduces exactly to the
+  !> unweighted Bader case when wA is uniformly 1 inside the mask and 0
+  !> outside.
+  !>
+  !> BANDS restricts the orbital basis to this explicit list of bands
+  !> instead of every band 1..nbndw(is) -- a cheap diagnostic to isolate
+  !> the box-sensitivity of a handful of (e.g. suspiciously delocalized)
+  !> bands without paying for the full basis at a wide BOX. NOTE: with
+  !> BANDS given, sum(eval) is NOT DI(A,B)/2 for the real system anymore --
+  !> it is only the (signed) contribution of those specific bands, useful
+  !> for comparing against the same restricted sum at a different BOX, not
+  !> for comparing against INTEGRABLE ... DELOC.
+  !>
+  !> SUPERBOX (default 0 0 0, i.e. just the home cell, as before) writes the
+  !> NAdO cubes on a (2*SUPERBOX+1)-cell box centred on the home cell
+  !> instead. This is NOT the same as tiling the single-cell cube in the
+  !> viewer afterwards: the real-space Wannier representation used here is
+  !> periodic over the *DFT k-mesh's* supercell, not the single cell, so a
+  !> naive tile would just repeat the truncated single-cell slice instead of
+  !> showing the orbital's actual (decaying) tail into neighbouring cells --
+  !> exactly the part that matters once BOX > 0 has pulled in neighbour-cell
+  !> Wannier copies. SUPERBOX re-evaluates the same underlying Bloch sum on
+  !> the larger box instead (no new DFT/wannier90 calculation needed, and no
+  !> extra FFTs -- same u_k(r) is reused, just re-phased over more points),
+  !> so isosurfaces that would otherwise be clipped or wrapped at the cell
+  !> boundary come out as a single connected shape. A sensible starting
+  !> point is SUPERBOX = BOX.
+  !>
+  !> Replaces the DGrid-based AOM + NAdO step of Menendez-Crespo et al.
+  !> ("nadosolid"): computes the 2-centre Natural Adaptive Orbitals (NAdOs)
+  !> and their occupation numbers (NAdOccs) for the pair of Bader basins
+  !> A = (idA,ivecA) and B = (idB,ivecB), idA/idB being indices into the
+  !> complete-cell atom list (c%atcel) and ivecA/ivecB an optional lattice
+  !> translation (default 0 0 0), from the periodic Wannier-function
+  !> representation of a wavefunction loaded from a Quantum ESPRESSO .pwc
+  !> file (FIELD fieldid selects which loaded field carries the Wannier
+  !> data; it defaults to the reference field if that one has it). The
+  !> Bader partition used to define the basins is computed on the BASIN
+  !> field (defaults to the reference field, normally the AE density).
+  !>
+  !> Theory (nadosolid.tex, sec. "Natural adaptive orbitals"): for a
+  !> single-determinant wavefunction the 2-centre matrix to diagonalize is
+  !> G^{AB} = (S^A S^B + S^B S^A)/2, where S^A, S^B are the atomic overlap
+  !> matrices (AOMs) of basins A and B in the orbital basis (here: Wannier
+  !> functions, translated copies included). Diagonalizing G^{AB} (Hermitian
+  !> but NOT positive-semidefinite -- unlike S^A or S^B alone, it can and
+  !> does have negative eigenvalues, the anti-bonding NAdOccs) gives the
+  !> NAdOs (eigenvectors, expanded back into a real-space cube) and NAdOccs
+  !> (eigenvalues n_i^{AB}). Their sum recovers half the delocalization
+  !> index: sum_i n_i^{AB} = <N_AB> = DI(A,B)/2, which should match (up to
+  !> the finite BOX truncation of the Wannier basis used here) the DI(A,B)
+  !> printed by "INTEGRABLE ... DELOC" for the same pair -- a good
+  !> self-consistency check when trying this out on a new system.
+  !>
+  !> The orbital basis used to build S^A, S^B is every occupied Wannier
+  !> function (band ibnd = 1..nbndw(is), spin is) translated by every
+  !> lattice vector within +-BOX of the home cell (default BOX 1 1 1, i.e.
+  !> the 3x3x3 = 27 nearest replicas); this must be wide enough to contain
+  !> essentially all of the spread of every Wannier function overlapping
+  !> either basin, or the NAdOccs will not add up to DI(A,B) -- widen BOX
+  !> if the self-consistency check above fails. NOROTATE uses the raw
+  !> (disentangled, generally more delocalized) Wannier gauge instead of
+  !> the U-matrix-rotated (maximally localized) one.
+  !>
+  !> One cube file per kept NAdO is written, named
+  !> <prefix>_s<spin>_<bonding|antibonding>_<rank>_n<occ>.cube (up to
+  !> MAXNADO cubes per spin and per sign, only for |NAdOcc| >= OCCMIN).
+  !> Each eigenvector's one remaining global phase is first rotated to
+  !> maximize its real part (a genuine gauge fix -- eigenvalues, hence
+  !> physics, are unaffected) before writing only the real part to the
+  !> cube; a warning is printed if the discarded imaginary part is still
+  !> not negligible even after that optimal rotation (a sign that the
+  !> underlying orbital basis does not have a mutually consistent real
+  !> gauge -- e.g. expected for PSINK on un-rotated Bloch states, unlike a
+  !> well-converged Wannier basis).
+  subroutine trick_nados(line0)
+    use tools_io, only: getword, isinteger, equal, lower, ferror, faterr, warning,&
+       uout, string, ioj_center, ioj_right, fclose
+    use tools_math, only: eigherm
+    use systemmod, only: sy
+    use fieldmod, only: type_grid
+    use bader, only: bader_integrate, bader_remap
+    use yt, only: yt_integrate, yt_weights, yt_remap, ytdata, ytdata_clean
+    use types, only: basindat, realloc
+    use param, only: img
+    character*(*), intent(in) :: line0
+
+    character(len=:), allocatable :: word, prefix, sgn
+    integer :: lp, lp2, i, j, k, is, ib, ibx, i1, i2, i3, itmp
+    integer :: idA, idB, ivecA(3), ivecB(3), ivec0(3), fid, basid, box(3)
+    integer :: n1, n2, n3, nvec(3), ntot, nattn, kA, kB, nspin, nbo, nA, nB
+    integer :: nmo, imo, m1, m2, m3, maxnado, nkept, irank, nkeep, nbandlist
+    integer :: superbox(3), nb1, nb2, nb3
+    logical :: ok, rotate, useyt, usepsink
+    real*8 :: occmin, domega, ximag, ev(3), xd0(3,3), x00(3), fspin, theta
+    real*8 :: wancut, xA(3), xB(3), xc(3), spr, dA, dB
+    complex*16 :: zphase
+    integer, allocatable :: iatt(:), ilvec(:,:), idg1(:,:,:), bandlist(:)
+    integer, allocatable :: mobnd(:), movec(:,:), moik(:), keepj(:), keeprank(:)
+    logical, allocatable :: maskA(:,:,:), maskB(:,:,:)
+    real*8, allocatable :: wyt(:,:,:), wAc(:), wBc(:), occwt(:)
+    complex*16, allocatable :: wa(:,:,:), w2a(:,:), w2aw(:,:), w2b(:,:), w2bw(:,:), wbig(:,:,:)
+    complex*16, allocatable :: sa(:,:), sb(:,:), gab(:,:)
+    real*8, allocatable :: eval(:)
+    real*8, allocatable :: nado(:,:,:)
+    complex*16, allocatable :: ndc(:,:,:,:)
+    type(basindat) :: bas
+    type(ytdata) :: dat
+
+    ! defaults
+    fid = -1
+    basid = -1
+    box = (/1,1,1/)
+    superbox = (/0,0,0/)
+    occmin = 1d-2
+    maxnado = 4
+    prefix = "nado"
+    rotate = .true.
+    useyt = .false.
+    usepsink = .false.
+    wancut = 0d0
+    ivecA = 0
+    ivecB = 0
+
+    ! atom A: id and optional lattice vector
+    lp = 1
+    ok = isinteger(idA,line0,lp)
+    if (.not.ok) then
+       call ferror('trick_nados','Error: atom id A not provided',faterr)
+       return
+    end if
+    ! Peek for an optional "ix iy iz" triple after the atom id. Read into
+    ! temporaries and only commit (ivecA, lp) if all three integers are
+    ! present -- Fortran's .and. is not guaranteed to short-circuit, so
+    ! chaining isinteger() calls directly into ivecA(:) would leave it
+    ! partially overwritten (e.g. by the NEXT atom's id) whenever only one
+    ! or two of the three numbers happen to be there.
+    lp2 = lp
+    ivec0 = 0
+    if (isinteger(ivec0(1),line0,lp2)) then
+       if (isinteger(ivec0(2),line0,lp2)) then
+          if (isinteger(ivec0(3),line0,lp2)) then
+             ivecA = ivec0
+             lp = lp2
+          end if
+       end if
+    end if
+
+    ! atom B: id and optional lattice vector
+    ok = isinteger(idB,line0,lp)
+    if (.not.ok) then
+       call ferror('trick_nados','Error: atom id B not provided',faterr)
+       return
+    end if
+    lp2 = lp
+    ivec0 = 0
+    if (isinteger(ivec0(1),line0,lp2)) then
+       if (isinteger(ivec0(2),line0,lp2)) then
+          if (isinteger(ivec0(3),line0,lp2)) then
+             ivecB = ivec0
+             lp = lp2
+          end if
+       end if
+    end if
+
+    ! options
+    do
+       word = getword(line0,lp)
+       if (len_trim(word) == 0) exit
+       if (equal(lower(word),'field')) then
+          word = getword(line0,lp)
+          fid = sy%fieldname_to_idx(word)
+       else if (equal(lower(word),'basin')) then
+          word = getword(line0,lp)
+          basid = sy%fieldname_to_idx(word)
+       else if (equal(lower(word),'box')) then
+          ok = isinteger(box(1),line0,lp) .and. isinteger(box(2),line0,lp) .and. isinteger(box(3),line0,lp)
+          if (.not.ok) then
+             call ferror('trick_nados','Error: BOX requires three integers',faterr)
+             return
+          end if
+       else if (equal(lower(word),'superbox')) then
+          ok = isinteger(superbox(1),line0,lp) .and. isinteger(superbox(2),line0,lp) .and.&
+             isinteger(superbox(3),line0,lp)
+          if (.not.ok) then
+             call ferror('trick_nados','Error: SUPERBOX requires three integers',faterr)
+             return
+          end if
+       else if (equal(lower(word),'bands')) then
+          ! restrict the orbital basis to this explicit list of bands
+          ! instead of 1..nbndw(is) -- a cheap way to isolate the
+          ! contribution of a few (e.g. poorly-localized) bands without
+          ! paying for the full basis at a wide BOX
+          nbandlist = 0
+          allocate(bandlist(8))
+          do
+             lp2 = lp
+             if (.not.isinteger(itmp,line0,lp2)) exit
+             lp = lp2
+             nbandlist = nbandlist + 1
+             if (nbandlist > size(bandlist)) call realloc(bandlist,2*nbandlist)
+             bandlist(nbandlist) = itmp
+          end do
+          if (nbandlist == 0) then
+             call ferror('trick_nados','Error: BANDS requires at least one band index',faterr)
+             return
+          end if
+          call realloc(bandlist,nbandlist)
+       else if (equal(lower(word),'occmin')) then
+          word = getword(line0,lp)
+          read (word,*) occmin
+       else if (equal(lower(word),'maxnado')) then
+          ok = isinteger(maxnado,line0,lp)
+          if (.not.ok) then
+             call ferror('trick_nados','Error: MAXNADO requires an integer',faterr)
+             return
+          end if
+       else if (equal(lower(word),'prefix')) then
+          prefix = getword(line0,lp)
+       else if (equal(lower(word),'norotate')) then
+          rotate = .false.
+       else if (equal(lower(word),'yt')) then
+          useyt = .true.
+       else if (equal(lower(word),'psink')) then
+          usepsink = .true.
+       else if (equal(lower(word),'wancut')) then
+          word = getword(line0,lp)
+          read (word,*) wancut
+       else
+          call ferror('trick_nados','Unknown keyword: '//trim(word),faterr,line0,syntax=.true.)
+          return
+       end if
+    end do
+
+    ! check the atom ids
+    if (idA < 1 .or. idA > sy%c%ncel .or. idB < 1 .or. idB > sy%c%ncel) then
+       call ferror('trick_nados','Error: atom id out of range of the complete atom list',faterr)
+       return
+    end if
+
+    ! the field with the Wannier (QE) data
+    if (fid == -1) fid = sy%iref
+    if (.not.sy%goodfield(fid)) then
+       call ferror('trick_nados','Error: FIELD not initialized',faterr)
+       return
+    end if
+    if (sy%f(fid)%type /= type_grid) then
+       call ferror('trick_nados','Error: FIELD is not a grid',faterr)
+       return
+    end if
+    if (sy%f(fid)%grid%qe%nbnd <= 0) then
+       call ferror('trick_nados','Error: FIELD has no Wannier/QE data (load a .pwc, or give FIELD)',faterr)
+       return
+    end if
+    nspin = sy%f(fid)%grid%qe%nspin
+    n1 = sy%f(fid)%grid%n(1)
+    n2 = sy%f(fid)%grid%n(2)
+    n3 = sy%f(fid)%grid%n(3)
+    ntot = n1*n2*n3
+    domega = sy%c%omega / real(ntot,8)
+
+    ! the field used for the Bader partition (defaults to the reference field)
+    if (basid == -1) basid = sy%iref
+    if (.not.sy%goodfield(basid)) then
+       call ferror('trick_nados','Error: BASIN field not initialized',faterr)
+       return
+    end if
+    if (sy%f(basid)%type /= type_grid) then
+       call ferror('trick_nados','Error: BASIN field is not a grid',faterr)
+       return
+    end if
+    if (any(sy%f(basid)%grid%n /= (/n1,n2,n3/))) then
+       call ferror('trick_nados','Error: BASIN field grid size does not match FIELD',faterr)
+       return
+    end if
+
+    ! Bader/YT partition, remapped to the complete cell (+ translations)
+    bas%n = (/n1,n2,n3/)
+    allocate(bas%f(n1,n2,n3))
+    bas%f = sy%f(basid)%grid%f
+    bas%atexist = .true.
+    bas%ratom = 1d40
+    bas%expr = ""
+    if (useyt) then
+       bas%luw = 0
+       call yt_integrate(sy,bas)
+       call yt_weights(luw=bas%luw,dout=dat)
+       call yt_remap(sy,bas,dat,nattn,ilvec,iatt)
+    else
+       call bader_integrate(sy,bas,basid)
+       call bader_remap(sy,bas,nattn,idg1,ilvec,iatt)
+    end if
+
+    ! locate the extended attractor index for A and B (id + lattice vector)
+    kA = 0
+    if (all(ivecA == 0)) then
+       kA = idA
+    else
+       do k = bas%nattr+1, nattn
+          if (iatt(k) == idA .and. all(ilvec(:,k) == ivecA)) then
+             kA = k
+             exit
+          end if
+       end do
+    end if
+    kB = 0
+    if (all(ivecB == 0)) then
+       kB = idB
+    else
+       do k = bas%nattr+1, nattn
+          if (iatt(k) == idB .and. all(ilvec(:,k) == ivecB)) then
+             kB = k
+             exit
+          end if
+       end do
+    end if
+    if (kA == 0 .or. kB == 0) then
+       call ferror('trick_nados','Error: could not find the requested basin(s) (increase the search '//&
+          'box in the Bader/YT calculation, or check the atom ids/lattice vectors)',faterr)
+       return
+    end if
+    write (uout,'("* NAdOs for the pair: A = atom ",A," (",3(A," "),") ",99(" "))') string(idA),&
+       (string(ivecA(j)),j=1,3)
+    write (uout,'("                       B = atom ",A," (",3(A," "),") ",99(" "))') string(idB),&
+       (string(ivecB(j)),j=1,3)
+    write (uout,'("  Wannier/QE field: ",A,", Bader/basin field: ",A)') string(fid), string(basid)
+    write (uout,'("  Search box (+-lattice vectors): ",3(A," "))') (string(box(j)),j=1,3)
+    if (wancut > 0d0) &
+       write (uout,'("  Adaptive WANCUT: skipping orbitals with (spread)*cutoff < distance to A or B, cutoff = ",A)')&
+          string(wancut,'f',6,2)
+
+    ! cartesian reference points for the WANCUT distance test: the (possibly
+    ! translated) atomic positions that define basins A and B -- NOT
+    ! bas%xattr(:,kA/kB), which is only sized for the un-remapped (home
+    ! cell) attractors and would be wrong/out of bounds whenever kA or kB
+    ! is an extended (translated) attractor
+    xA = sy%c%x2c(sy%c%atcel(idA)%x + real(ivecA,8))
+    xB = sy%c%x2c(sy%c%atcel(idB)%x + real(ivecB,8))
+
+    ! the two basin masks -- and, for YT, the (real-valued, in [0,1])
+    ! fractional weight at each masked point, since unlike Bader's hard
+    ! partition, YT points near a basin boundary can be shared between
+    ! basins. wAc/wBc are 1.0 uniformly for Bader (an ordinary 0/1 mask),
+    ! so the weighted matmul below (Sa = matmul(conjg(w2a)^T,w2a*wAc)) is
+    ! exactly the old unweighted one in that case.
+    if (useyt) then
+       allocate(wyt(n1,n2,n3))
+       call yt_weights(din=dat,idb=kA,w=wyt)
+       maskA = (wyt > 1d-10)
+       allocate(wAc(count(maskA)))
+       wAc = pack(wyt,maskA)
+       call yt_weights(din=dat,idb=kB,w=wyt)
+       maskB = (wyt > 1d-10)
+       allocate(wBc(count(maskB)))
+       wBc = pack(wyt,maskB)
+       deallocate(wyt)
+    else
+       maskA = (idg1 == kA)
+       maskB = (idg1 == kB)
+       allocate(wAc(count(maskA)),wBc(count(maskB)))
+       wAc = 1d0
+       wBc = 1d0
+    end if
+    nA = count(maskA)
+    nB = count(maskB)
+    if (usepsink .and. any(superbox /= 0)) then
+       call ferror('trick_nados','Error: SUPERBOX is not supported yet with PSINK',faterr)
+       return
+    end if
+    allocate(wa(n1,n2,n3))
+    do is = 1, nspin
+       if (nspin == 1) then
+          fspin = 2d0
+       else
+          fspin = 1d0
+       end if
+
+       if (usepsink) then
+          ! PSINK: the orbital basis is every (band,k-point) pair, weighted
+          ! by sqrt(occ/fspin) -- see below. No BOX search is needed here
+          ! (unlike the Wannier case): summing over the full k-point mesh
+          ! already reconstructs the periodic function exactly, not just within
+          ! some finite lattice-translation cutoff. This is also the only
+          ! basis that is meaningful for a metal, where occupation is
+          ! k-dependent and cannot be attributed to a single real-space
+          ! Wannier function the way the (band,translation) basis assumes.
+          if (allocated(bandlist)) then
+             nbo = nbandlist
+             if (any(bandlist < 1) .or. any(bandlist > sy%f(fid)%grid%qe%nbnd)) then
+                call ferror('trick_nados','Error: BANDS index out of range of nbnd',faterr)
+                return
+             end if
+          else
+             nbo = sy%f(fid)%grid%qe%nbnd
+          end if
+          nmo = nbo * sy%f(fid)%grid%qe%nks
+          allocate(mobnd(nmo),moik(nmo),occwt(nmo))
+          imo = 0
+          do ibx = 1, nbo
+             if (allocated(bandlist)) then
+                ib = bandlist(ibx)
+             else
+                ib = ibx
+             end if
+             do k = 1, sy%f(fid)%grid%qe%nks
+                imo = imo + 1
+                mobnd(imo) = ib
+                moik(imo) = k
+                occwt(imo) = sqrt(max(sy%f(fid)%grid%qe%occ(ib,k,is),0d0)/fspin)
+             end do
+          end do
+
+          write (uout,'("  Spin ",A,": building ",A," psink (band,k-point) orbitals on the grid...")')&
+             string(is), string(nmo)
+          allocate(w2a(nA,nmo),w2aw(nA,nmo),w2b(nB,nmo),w2bw(nB,nmo))
+          do imo = 1, nmo
+             call sy%f(fid)%grid%get_qe_psink_standalone(sy%c%omega,mobnd(imo),moik(imo),is,.true.,&
+                (/0,0,0/),wa)
+             wa = wa * occwt(imo)
+             w2a(:,imo) = pack(wa,maskA)
+             w2b(:,imo) = pack(wa,maskB)
+             w2aw(:,imo) = w2a(:,imo) * wAc
+             w2bw(:,imo) = w2b(:,imo) * wBc
+          end do
+       else
+          if (allocated(bandlist)) then
+             nbo = nbandlist
+             if (any(bandlist < 1) .or. any(bandlist > sy%f(fid)%grid%qe%nbndw(is))) then
+                call ferror('trick_nados','Error: BANDS index out of range of nbndw',faterr)
+                return
+             end if
+          else
+             nbo = sy%f(fid)%grid%qe%nbndw(is)
+          end if
+          if (wancut > 0d0) then
+             ! Adaptive: BOX is still the outer enumeration bound (so the
+             ! search stays finite and user-controlled), but a candidate
+             ! (band,translation) is only kept if its Wannier centre is
+             ! within spread*wancut of basin A or B -- exactly the
+             ! criterion calc_sij_wannier uses internally. Distance-only
+             ! checks are cheap; this lets a much bigger BOX be given
+             ! affordably, since only the pairs plausibly overlapping A or
+             ! B ever reach the expensive get_qe_wnr_standalone call below.
+             ! Two passes: count first (to size mobnd/movec exactly), then
+             ! fill.
+             nmo = 0
+             do ibx = 1, nbo
+                if (allocated(bandlist)) then
+                   ib = bandlist(ibx)
+                else
+                   ib = ibx
+                end if
+                spr = sy%f(fid)%grid%qe%spread(ib,is)
+                do m1 = -box(1), box(1)
+                   do m2 = -box(2), box(2)
+                      do m3 = -box(3), box(3)
+                         xc = sy%c%x2c(sy%f(fid)%grid%qe%center(:,ib,is) + real((/m1,m2,m3/),8))
+                         dA = norm2(xc-xA)
+                         dB = norm2(xc-xB)
+                         if (spr*wancut > min(dA,dB)) nmo = nmo + 1
+                      end do
+                   end do
+                end do
+             end do
+             allocate(mobnd(nmo),movec(3,nmo))
+             imo = 0
+             do ibx = 1, nbo
+                if (allocated(bandlist)) then
+                   ib = bandlist(ibx)
+                else
+                   ib = ibx
+                end if
+                spr = sy%f(fid)%grid%qe%spread(ib,is)
+                do m1 = -box(1), box(1)
+                   do m2 = -box(2), box(2)
+                      do m3 = -box(3), box(3)
+                         xc = sy%c%x2c(sy%f(fid)%grid%qe%center(:,ib,is) + real((/m1,m2,m3/),8))
+                         dA = norm2(xc-xA)
+                         dB = norm2(xc-xB)
+                         if (spr*wancut > min(dA,dB)) then
+                            imo = imo + 1
+                            mobnd(imo) = ib
+                            movec(:,imo) = (/m1,m2,m3/)
+                         end if
+                      end do
+                   end do
+                end do
+             end do
+             write (uout,'("  WANCUT kept ",A," of ",A," candidate (band,translation) orbitals")')&
+                string(nmo), string(nbo*(2*box(1)+1)*(2*box(2)+1)*(2*box(3)+1))
+          else
+             nmo = nbo * (2*box(1)+1) * (2*box(2)+1) * (2*box(3)+1)
+             allocate(mobnd(nmo),movec(3,nmo))
+             imo = 0
+             do ibx = 1, nbo
+                if (allocated(bandlist)) then
+                   ib = bandlist(ibx)
+                else
+                   ib = ibx
+                end if
+                do m1 = -box(1), box(1)
+                   do m2 = -box(2), box(2)
+                      do m3 = -box(3), box(3)
+                         imo = imo + 1
+                         mobnd(imo) = ib
+                         movec(:,imo) = (/m1,m2,m3/)
+                      end do
+                   end do
+                end do
+             end do
+          end if
+
+          ! Build every Wannier orbital on the grid ONE AT A TIME (a full grid
+          ! for all nmo orbitals at once does not fit in memory for anything
+          ! beyond toy systems -- e.g. nbnd=50, a 180^3-ish grid and a 3x3x3
+          ! search box is already > 100 GB), keeping only the compact values
+          ! at the two basins (w2a, w2b), which are what S^A, S^B need. Every
+          ! band here is implicitly weighted 1.0 (i.e. occ=fspin, matching
+          ! the insulator-only assumption behind nbndw) -- see PSINK for the
+          ! general, occupation-weighted case.
+          write (uout,'("  Spin ",A,": building ",A," Wannier orbitals on the grid...")') string(is), string(nmo)
+          allocate(w2a(nA,nmo),w2aw(nA,nmo),w2b(nB,nmo),w2bw(nB,nmo))
+          do imo = 1, nmo
+             call sy%f(fid)%grid%get_qe_wnr_standalone(sy%c%omega,mobnd(imo),is,movec(:,imo),rotate,wa)
+             w2a(:,imo) = pack(wa,maskA)
+             w2b(:,imo) = pack(wa,maskB)
+             w2aw(:,imo) = w2a(:,imo) * wAc
+             w2bw(:,imo) = w2b(:,imo) * wBc
+          end do
+       end if
+
+       ! Sa(i,j) = sum_r wA(r) * conjg(orb_i(r)) * orb_j(r) -- the basin
+       ! weight (1.0 for Bader, fractional for YT) is applied to just one
+       ! side of the product, not squared; the occupation weight (PSINK
+       ! only, folded into orb_i/orb_j themselves as sqrt(occ/fspin)) is
+       ! therefore also applied once per orbital, twice per matrix element,
+       ! as it should be
+       allocate(sa(nmo,nmo),sb(nmo,nmo),gab(nmo,nmo),eval(nmo))
+       sa = matmul(transpose(conjg(w2a)),w2aw) * domega
+       sb = matmul(transpose(conjg(w2b)),w2bw) * domega
+       gab = 0.5d0 * (matmul(sa,sb) + matmul(sb,sa))
+       deallocate(w2a,w2aw,w2b,w2bw,sa,sb)
+
+       call eigherm(gab,nmo,eval)
+
+       ! Sa, Sb (and hence gab and its eigenvalues) were built from bare,
+       ! per-spin-channel orbital overlaps -- exactly like critic2's own
+       ! Fa = Tr[S^A S^B] (see calc_fa_wannier/calc_fa_psink and their use
+       ! in the DI printout, integration@proc.f90). There, DI(A,B) =
+       ! 2*Fa*fspin. Since sum(eval) = Tr[gab] = Fa here, and the theory
+       ! (nadosolid.tex) defines sum_i n_i^{AB} = <N_AB> = DI(A,B)/2 =
+       ! Fa*fspin, the reported/kept eigenvalues need that same fspin
+       ! factor -- applied only to the reported occupations, not to the
+       ! eigenvectors (the NAdO shape itself does not change). This makes
+       ! sum(eval) below an exact match (not just approximate) for half of
+       ! whatever INTEGRABLE ... DELOC reports.
+       eval = eval * fspin
+
+       write (uout,'("  Sum of NAdOccs (= <N_AB> = DI(A,B)/2): ",A)') string(sum(eval),'e',14,6)
+       write (uout,'("  (compare against DI(A,B) from INTEGRABLE ... DELOC for the same pair)")')
+       write (uout,'("# ",99(A," "))') string("rank",4,ioj_center), string("NAdOcc",14,ioj_center),&
+          string("character",10,ioj_center)
+       do irank = 1, nmo
+          j = nmo - irank + 1 ! eigherm returns ascending order
+          if (eval(j) >= 0d0) then
+             sgn = "bonding"
+          else
+             sgn = "antibonding"
+          end if
+          if (abs(eval(j)) >= occmin) &
+             write (uout,'("  ",99(A," "))') string(irank,4,ioj_center),&
+                string(eval(j),'f',14,8,ioj_right), string(sgn,10,ioj_center)
+       end do
+
+       ! decide, up front, which eigenvectors to reconstruct (up to MAXNADO
+       ! bonding + MAXNADO antibonding, above OCCMIN), so that the orbitals
+       ! only need to be rebuilt once more (a second full sweep, not one
+       ! sweep per kept NAdO) and only NKEEP (<= 2*MAXNADO) full-grid
+       ! accumulators are ever held in memory
+       allocate(keepj(2*maxnado),keeprank(2*maxnado))
+       nkeep = 0
+       do k = 1, 2
+          nkept = 0
+          do irank = 1, nmo
+             if (k == 1) then
+                j = nmo - irank + 1 ! descending eval: bonding first
+                if (eval(j) < occmin) exit
+             else
+                j = irank ! ascending eval: most negative (antibonding) first
+                if (eval(j) > -occmin) exit
+             end if
+             nkept = nkept + 1
+             if (nkept > maxnado) exit
+             nkeep = nkeep + 1
+             keepj(nkeep) = j
+             keeprank(nkeep) = nkept
+          end do
+       end do
+
+       ! second sweep: rebuild every orbital once more (this time possibly on
+       ! a (2*SUPERBOX+1)-cell box instead of just the home cell -- see the
+       ! SUPERBOX note above) and accumulate its contribution into every kept
+       ! NAdO at once; phi_j(r) = sum_imo gab(imo,j)*W_imo(r)
+       if (nkeep > 0) then
+          nvec = (/n1,n2,n3/)
+          nb1 = (2*superbox(1)+1)*n1
+          nb2 = (2*superbox(2)+1)*n2
+          nb3 = (2*superbox(3)+1)*n3
+          allocate(wbig(nb1,nb2,nb3))
+          allocate(ndc(nb1,nb2,nb3,nkeep))
+          ndc = 0d0
+          do imo = 1, nmo
+             if (usepsink) then
+                call sy%f(fid)%grid%get_qe_psink_standalone(sy%c%omega,mobnd(imo),moik(imo),is,.true.,&
+                   (/0,0,0/),wbig)
+                wbig = wbig * occwt(imo)
+             else
+                call sy%f(fid)%grid%get_qe_wnr_standalone(sy%c%omega,mobnd(imo),is,movec(:,imo),rotate,wbig,&
+                   ioffset=-superbox)
+             end if
+             do i = 1, nkeep
+                ndc(:,:,:,i) = ndc(:,:,:,i) + gab(imo,keepj(i)) * wbig
+             end do
+          end do
+          deallocate(wbig)
+
+          ! voxel vectors at the original (single-cell) resolution, origin
+          ! shifted back by SUPERBOX cells so the home cell sits centred in
+          ! the box instead of in a corner
+          do i = 1, 3
+             ev = 0d0
+             ev(i) = 1d0
+             xd0(:,i) = sy%c%x2c(ev) / real(nvec(i),8)
+          end do
+          x00 = sy%c%x2c(-real(superbox,8))
+
+          allocate(nado(nb1,nb2,nb3))
+          do i = 1, nkeep
+             j = keepj(i)
+             if (eval(j) >= 0d0) then
+                sgn = "bonding"
+             else
+                sgn = "antibonding"
+             end if
+             ! Each eigenvector still carries one overall, physically
+             ! meaningless global phase (multiplying it by e^{i*alpha} is
+             ! the same eigenvector). Before discarding Im(phi), rotate by
+             ! the alpha that makes phi as real as possible: writing
+             ! phi=a+ib, the alpha maximizing sum[Re(e^{-i*alpha}*phi)]^2 is
+             ! alpha = arg(sum(phi^2))/2 -- sum(phi^2) = sum(a^2-b^2) +
+             ! i*sum(2ab), whose argument is exactly twice the angle that
+             ! aligns phi with the real axis in the least-squares sense.
+             ! This is a genuine gauge fix, not a hack -- it cannot change
+             ! the eigenvalue (still the same eigenvector) and it leaves a
+             ! perfectly real orbital exactly real. What is left over after
+             ! this optimal rotation is a gauge-INDEPENDENT measure of how
+             ! genuinely complex this NAdO is (e.g. always large for PSINK
+             ! on un-rotated Bloch states, where no single global phase can
+             ! fix a per-orbital phase inconsistency).
+             zphase = sum(ndc(:,:,:,i)**2)
+             if (abs(zphase) > 0d0) then
+                theta = 0.5d0 * atan2(aimag(zphase),real(zphase,8))
+                ndc(:,:,:,i) = ndc(:,:,:,i) * exp(-img*theta)
+             end if
+             ximag = sum(abs(aimag(ndc(:,:,:,i))))
+             if (ximag > 1d-3*max(1d0,sum(abs(real(ndc(:,:,:,i),8))))) &
+                call ferror('trick_nados',&
+                   'the discarded imaginary part of this NAdO is not negligible after '//&
+                   'optimal global-phase rotation (genuinely non-real gauge, not just '//&
+                   'an arbitrary overall phase)',warning)
+             nado = real(ndc(:,:,:,i),8)
+
+             call sy%c%writegrid_cube(nado,trim(prefix)//"_s"//string(is)//"_"//trim(sgn)//"_"//&
+                string(keeprank(i))//"_n"//string(eval(j),'f',6,4)//".cube",.false.,.false.,xd0,x00)
+          end do
+          deallocate(nado,ndc)
+       end if
+
+       if (usepsink) then
+          deallocate(mobnd,moik,occwt)
+       else
+          deallocate(mobnd,movec)
+       end if
+       deallocate(gab,eval,keepj,keeprank)
+    end do
+
+    if (useyt) then
+       call ytdata_clean(dat)
+       if (bas%luw /= 0) call fclose(bas%luw)
+    else
+       deallocate(idg1)
+    end if
+    deallocate(wa,bas%f,ilvec,iatt,maskA,maskB,wAc,wBc)
+
+  end subroutine trick_nados
+
+  !> TRICK PSINKNORM fieldid ibnd ik ispin
+  !>
+  !> Diagnostic: builds a single Bloch state psi_{ibnd,ik,ispin} via
+  !> get_qe_psink_standalone and reports int|psi|^2 dr over one cell, which
+  !> must equal exactly 1.0 for a correctly normalized Bloch state -- a
+  !> fast, single-orbital way to check the normalization convention used
+  !> by trick_nados's PSINK mode, without paying for a full nmo build.
+  subroutine trick_psinknorm(line0)
+    use tools_io, only: getword, isinteger, ferror, faterr, uout, string
+    use systemmod, only: sy
+    use fieldmod, only: type_grid
+    character*(*), intent(in) :: line0
+
+    character(len=:), allocatable :: word
+    integer :: lp, fid, ibnd, ik, ispin, n1, n2, n3, ntot
+    logical :: ok
+    real*8 :: domega, xnorm
+    complex*16, allocatable :: wa(:,:,:)
+
+    lp = 1
+    word = getword(line0,lp)
+    fid = sy%fieldname_to_idx(word)
+    ok = isinteger(ibnd,line0,lp)
+    ok = ok .and. isinteger(ik,line0,lp)
+    ok = ok .and. isinteger(ispin,line0,lp)
+    if (.not.ok) then
+       call ferror('trick_psinknorm','Error: syntax is PSINKNORM fieldid ibnd ik ispin',faterr)
+       return
+    end if
+
+    if (.not.sy%goodfield(fid)) then
+       call ferror('trick_psinknorm','Error: FIELD not initialized',faterr)
+       return
+    end if
+    if (sy%f(fid)%type /= type_grid) then
+       call ferror('trick_psinknorm','Error: FIELD is not a grid',faterr)
+       return
+    end if
+
+    n1 = sy%f(fid)%grid%n(1)
+    n2 = sy%f(fid)%grid%n(2)
+    n3 = sy%f(fid)%grid%n(3)
+    ntot = n1*n2*n3
+    domega = sy%c%omega / real(ntot,8)
+
+    allocate(wa(n1,n2,n3))
+    call sy%f(fid)%grid%get_qe_psink_standalone(sy%c%omega,ibnd,ik,ispin,.true.,(/0,0,0/),wa)
+    xnorm = sum(abs(wa)**2) * domega
+    write (uout,'("  band=",A," k=",A," spin=",A,": int|psi|^2 dr (should be exactly 1.0): ",A)')&
+       string(ibnd), string(ik), string(ispin), string(xnorm,'f',14,8)
+    deallocate(wa)
+
+  end subroutine trick_psinknorm
 
 end module tricks
