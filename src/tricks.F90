@@ -37,6 +37,9 @@ module tricks
   private :: trick_calculate_displacements
   private :: trick_nados
   private :: trick_psinknorm
+  private :: trick_wnrortho
+  private :: trick_denscheck
+  private :: trick_umatcheck
 
 contains
 
@@ -72,6 +75,12 @@ contains
        call trick_nados(line0(lp:))
     else if (equal(word,'psinknorm')) then
        call trick_psinknorm(line0(lp:))
+    else if (equal(word,'wnrortho')) then
+       call trick_wnrortho(line0(lp:))
+    else if (equal(word,'denscheck')) then
+       call trick_denscheck(line0(lp:))
+    else if (equal(word,'umatcheck')) then
+       call trick_umatcheck(line0(lp:))
     else
        call ferror('trick','Unknown keyword: ' // trim(word),faterr,line0,syntax=.true.)
        return
@@ -3582,24 +3591,54 @@ contains
     use bader, only: bader_integrate, bader_remap
     use yt, only: yt_integrate, yt_weights, yt_remap, ytdata, ytdata_clean
     use types, only: basindat, realloc
-    use param, only: img
+    use param, only: img, tpi
+    use crystalmod, only: crystal
+    use crystalseedmod, only: crystalseed
     character*(*), intent(in) :: line0
+
+    ! A single periodic image of basin A or B: its (n1,n2,n3) mask/weight
+    ! (needed once, spin-independent) and its accumulated nmo x nmo overlap
+    ! matrix (rebuilt per spin). See the comment above the image-list
+    ! construction below for why multiple images per atom are needed at
+    ! all: calc_sij_wannier's reference DI value for a "single" atom pair
+    ! is actually a sum over every periodic image of that atom found in
+    ! the Bader/YT remap, each shifted back into a common orbital-index
+    ! frame before accumulating -- using only the "home" image (as this
+    ! code did before) silently drops the other contributions and was
+    ! verified (on graphite) to be wrong by 40-70%.
+    type :: nados_image
+       logical, allocatable :: mask(:,:,:)
+       real*8, allocatable :: wc(:)
+       integer :: n = 0
+       integer :: ilvec(3) = 0
+       complex*16, allocatable :: w(:,:)  ! (n,nmo) packed orbitals, temporary
+       complex*16, allocatable :: s(:,:)  ! (nmo,nmo) this image's overlap matrix
+    end type nados_image
 
     character(len=:), allocatable :: word, prefix, sgn
     integer :: lp, lp2, i, j, k, is, ib, ibx, i1, i2, i3, itmp
     integer :: idA, idB, ivecA(3), ivecB(3), ivec0(3), fid, basid, box(3)
     integer :: n1, n2, n3, nvec(3), ntot, nattn, kA, kB, nspin, nbo, nA, nB
     integer :: nmo, imo, m1, m2, m3, maxnado, nkept, irank, nkeep, nbandlist
-    integer :: superbox(3), nb1, nb2, nb3
+    integer :: superbox(3), nb1, nb2, nb3, nwan(3), mc(3), luevc(2), luevc_ibnd(2), ibcur, ilat, nkeptpair
+    integer :: nAimg, nBimg, iimg, jmo, ish(3), imo2, jmo2, ntt, irem, ptmp(3)
+    integer, allocatable :: shiftidx(:)
+    real*8 :: xtmp(3)
     logical :: ok, rotate, useyt, usepsink
     real*8 :: occmin, domega, ximag, ev(3), xd0(3,3), x00(3), fspin, theta
-    real*8 :: wancut, xA(3), xB(3), xc(3), spr, dA, dB
+    real*8 :: wancut, xA(3), xB(3), xAf(3), xBf(3), spr, dA, dB, xmi(3), trA, trB
     complex*16 :: zphase
+    type(crystalseed) :: ncseed
+    type(crystal) :: nc
+    type(nados_image), allocatable :: imgA(:), imgB(:)
+    logical, allocatable :: keepmask(:,:)
+    complex*16, allocatable :: satot(:,:), sbtot(:,:)
+    complex*16 :: pphase
     integer, allocatable :: iatt(:), ilvec(:,:), idg1(:,:,:), bandlist(:)
     integer, allocatable :: mobnd(:), movec(:,:), moik(:), keepj(:), keeprank(:)
     logical, allocatable :: maskA(:,:,:), maskB(:,:,:)
     real*8, allocatable :: wyt(:,:,:), wAc(:), wBc(:), occwt(:)
-    complex*16, allocatable :: wa(:,:,:), w2a(:,:), w2aw(:,:), w2b(:,:), w2bw(:,:), wbig(:,:,:)
+    complex*16, allocatable :: wa(:,:,:), w2a(:,:), w2aw(:,:), w2b(:,:), w2bw(:,:), wbig(:,:,:), f1(:,:,:,:)
     complex*16, allocatable :: sa(:,:), sb(:,:), gab(:,:)
     real*8, allocatable :: eval(:)
     real*8, allocatable :: nado(:,:,:)
@@ -3791,82 +3830,222 @@ contains
        call bader_remap(sy,bas,nattn,idg1,ilvec,iatt)
     end if
 
-    ! locate the extended attractor index for A and B (id + lattice vector)
-    kA = 0
-    if (all(ivecA == 0)) then
-       kA = idA
-    else
-       do k = bas%nattr+1, nattn
-          if (iatt(k) == idA .and. all(ilvec(:,k) == ivecA)) then
-             kA = k
-             exit
-          end if
-       end do
-    end if
-    kB = 0
-    if (all(ivecB == 0)) then
-       kB = idB
-    else
-       do k = bas%nattr+1, nattn
-          if (iatt(k) == idB .and. all(ilvec(:,k) == ivecB)) then
-             kB = k
-             exit
-          end if
-       end do
-    end if
-    if (kA == 0 .or. kB == 0) then
-       call ferror('trick_nados','Error: could not find the requested basin(s) (increase the search '//&
-          'box in the Bader/YT calculation, or check the atom ids/lattice vectors)',faterr)
-       return
-    end if
+    ! (No lookup of the requested (id,lattice vector) among the remapped
+    ! attractors is needed any more: the full per-atom tensors are built
+    ! from every periodic image and the requested ivecA/ivecB is selected
+    ! afterwards by an explicit shift, so any lattice vector is valid.)
     write (uout,'("* NAdOs for the pair: A = atom ",A," (",3(A," "),") ",99(" "))') string(idA),&
        (string(ivecA(j)),j=1,3)
     write (uout,'("                       B = atom ",A," (",3(A," "),") ",99(" "))') string(idB),&
        (string(ivecB(j)),j=1,3)
     write (uout,'("  Wannier/QE field: ",A,", Bader/basin field: ",A)') string(fid), string(basid)
-    write (uout,'("  Search box (+-lattice vectors): ",3(A," "))') (string(box(j)),j=1,3)
+    if (usepsink) then
+       write (uout,'("  Search box (+-lattice vectors): ",3(A," "))') (string(box(j)),j=1,3)
+    end if
     if (wancut > 0d0) &
        write (uout,'("  Adaptive WANCUT: skipping orbitals with (spread)*cutoff < distance to A or B, cutoff = ",A)')&
           string(wancut,'f',6,2)
 
-    ! cartesian reference points for the WANCUT distance test: the (possibly
-    ! translated) atomic positions that define basins A and B -- NOT
-    ! bas%xattr(:,kA/kB), which is only sized for the un-remapped (home
-    ! cell) attractors and would be wrong/out of bounds whenever kA or kB
-    ! is an extended (translated) attractor
+    ! cartesian reference points (kept for information only now; the
+    ! distance test below uses the fractional positions xAf/xBf instead)
     xA = sy%c%x2c(sy%c%atcel(idA)%x + real(ivecA,8))
     xB = sy%c%x2c(sy%c%atcel(idB)%x + real(ivecB,8))
 
-    ! the two basin masks -- and, for YT, the (real-valued, in [0,1])
-    ! fractional weight at each masked point, since unlike Bader's hard
-    ! partition, YT points near a basin boundary can be shared between
-    ! basins. wAc/wBc are 1.0 uniformly for Bader (an ordinary 0/1 mask),
-    ! so the weighted matmul below (Sa = matmul(conjg(w2a)^T,w2a*wAc)) is
-    ! exactly the old unweighted one in that case.
-    if (useyt) then
-       allocate(wyt(n1,n2,n3))
-       call yt_weights(din=dat,idb=kA,w=wyt)
-       maskA = (wyt > 1d-10)
-       allocate(wAc(count(maskA)))
-       wAc = pack(wyt,maskA)
-       call yt_weights(din=dat,idb=kB,w=wyt)
-       maskB = (wyt > 1d-10)
-       allocate(wBc(count(maskB)))
-       wBc = pack(wyt,maskB)
-       deallocate(wyt)
-    else
-       maskA = (idg1 == kA)
-       maskB = (idg1 == kB)
-       allocate(wAc(count(maskA)),wBc(count(maskB)))
-       wAc = 1d0
-       wBc = 1d0
+    if (.not.usepsink) then
+       ! Fractional (of the primitive cell) positions of basins A and B --
+       ! NOT bas%xattr(:,kA/kB), which is only sized for the un-remapped
+       ! (home cell) attractors and would be wrong/out of bounds whenever
+       ! kA or kB is an extended (translated) attractor.
+       xAf = sy%c%atcel(idA)%x + real(ivecA,8)
+       xBf = sy%c%atcel(idB)%x + real(ivecB,8)
+
+       ! The Wannier orbital search domain and its metric. A Wannier
+       ! orbital built by get_qe_wnr_standalone(movec=R) is EXACTLY
+       ! periodic in R with period nwan = qe%nk in each direction (for a
+       ! Gamma-centered MP mesh, e^{-i k.nwan} = 1 exactly, since k_i*nwan_i
+       ! is always an integer) -- so any (ia,ja,ka) outside [0,nwan) is a
+       ! redundant, byte-for-byte duplicate of one inside it, never a
+       ! genuinely different, more-decayed tail. This matches critic2's own
+       ! reference calc_sij_wannier, which never builds Wannier
+       ! translations beyond this domain either, and -- crucially -- also
+       ! uses the MINIMUM-IMAGE distance within that same nwan-periodic
+       ! domain (via a supercell's shortest(), not a naive unwrapped
+       ! Cartesian distance) when deciding which candidates are close
+       ! enough to a basin to matter. BOX/WANCUT's old unbounded
+       ! enumeration + unwrapped-distance combination could badly
+       ! misjudge/duplicate candidates and gave results that disagreed with
+       ! DELOC by ~1.5-2x on a real test case (graphite primitive cell,
+       ! nk=8x8x2); this block reproduces calc_sij_wannier's domain and
+       ! metric exactly instead.
+       nwan = sy%f(fid)%grid%qe%nk
+       if (any(nwan <= 0)) then
+          call ferror('trick_nados','Error: FIELD has no usable Wannier k-mesh (qe%nk); PSINK is '//&
+             'the only supported mode for this file',faterr)
+          return
+       end if
+       ncseed%isused = .true.
+       do i = 1, 3
+          ncseed%m_x2c(:,i) = sy%c%m_x2c(:,i) * nwan(i)
+       end do
+       ncseed%useabr = 2
+       ncseed%nat = 0
+       ncseed%havesym = 0
+       ncseed%findsym = 0
+       ncseed%ismolecule = sy%c%ismolecule
+       call nc%struct_new(ncseed,.true.)
+       write (uout,'("  Wannier k-mesh (exact orbital search domain): ",3(A," "))')&
+          (string(nwan(j)),j=1,3)
+       ! Build orbitals via rotate_qe_evc + get_qe_wnr, the same path
+       ! calc_sij_wannier itself uses (verified numerically identical to
+       ! get_qe_wnr_standalone; kept for the batched-per-band interface).
+       call sy%f(fid)%grid%rotate_qe_evc(luevc,luevc_ibnd,rotate)
     end if
-    nA = count(maskA)
-    nB = count(maskB)
-    if (usepsink .and. any(superbox /= 0)) then
-       call ferror('trick_nados','Error: SUPERBOX is not supported yet with PSINK',faterr)
-       return
+
+    if (.true.) then
+       ! Enumerate EVERY periodic image of atom idA/idB found by the
+       ! Bader/YT remap (bas%nattr+1..nattn), not just the "home" (ivec=0)
+       ! one. This matters: calc_sij_wannier's reference S^{atom} tensor is
+       ! itself a sum over every such image (each shifted back into a
+       ! common orbital-index frame via packidx before accumulating -- see
+       ! find_sij_translations/calc_sij_wannier in integration@proc.f90).
+       ! Using only the home image (as earlier versions of this code did)
+       ! silently drops the other images' contributions; verified on
+       ! graphite to be wrong by 40-70% for both LI(A) and DI(A,B).
+       nAimg = 1
+       do k = bas%nattr+1, nattn
+          if (iatt(k) == idA) nAimg = nAimg + 1
+       end do
+       allocate(imgA(nAimg))
+       imgA(1)%ilvec = 0
+       iimg = 1
+       do k = bas%nattr+1, nattn
+          if (iatt(k) == idA) then
+             iimg = iimg + 1
+             imgA(iimg)%ilvec = ilvec(:,k)
+          end if
+       end do
+       nBimg = 1
+       do k = bas%nattr+1, nattn
+          if (iatt(k) == idB) nBimg = nBimg + 1
+       end do
+       allocate(imgB(nBimg))
+       imgB(1)%ilvec = 0
+       iimg = 1
+       do k = bas%nattr+1, nattn
+          if (iatt(k) == idB) then
+             iimg = iimg + 1
+             imgB(iimg)%ilvec = ilvec(:,k)
+          end if
+       end do
+       write (uout,'("  Atom ",A," (A): ",A," periodic image(s) in the search box (incl. home)")')&
+          string(idA), string(nAimg)
+       write (uout,'("  Atom ",A," (B): ",A," periodic image(s) in the search box (incl. home)")')&
+          string(idB), string(nBimg)
+
+       ! Build each image's mask/weight (spin-independent -- computed once).
+       do iimg = 1, nAimg
+          if (iimg == 1) then
+             k = idA
+          else
+             k = 0
+             do i = bas%nattr+1, nattn
+                if (iatt(i) == idA .and. all(ilvec(:,i) == imgA(iimg)%ilvec)) then
+                   k = i
+                   exit
+                end if
+             end do
+          end if
+          if (useyt) then
+             ! yt_weights only understands BASE atom ids (1..bas%nattr),
+             ! not the extended index k -- querying it with idb=k (as an
+             ! earlier version of this code did) silently returns an empty
+             ! weight field for every non-home image. The correct approach
+             ! (matching calc_sij_wannier's YT branch exactly): query the
+             ! BASE atom's weight field, then separately restrict to the
+             ! grid points whose periodic-unwrapped position actually
+             ! belongs to THIS image (p == ilvec), via the same
+             ! shortest-image + round-trip check calc_sij_wannier uses.
+             allocate(wyt(n1,n2,n3))
+             call yt_weights(din=dat,idb=idA,w=wyt)
+             allocate(imgA(iimg)%mask(n1,n2,n3))
+             imgA(iimg)%mask = .false.
+             do i3 = 1, n3
+                do i2 = 1, n2
+                   do i1 = 1, n1
+                      if (abs(wyt(i1,i2,i3)) < 1d-15) cycle
+                      ptmp = (/i1,i2,i3/)
+                      xtmp = real(ptmp-1,8)/(/real(n1,8),real(n2,8),real(n3,8)/) - bas%xattr(:,idA)
+                      xmi = xtmp
+                      call sy%c%shortest(xmi,dA)
+                      ptmp = nint(xtmp - sy%c%c2x(xmi))
+                      imgA(iimg)%mask(i1,i2,i3) = all(ptmp == imgA(iimg)%ilvec)
+                   end do
+                end do
+             end do
+             imgA(iimg)%n = count(imgA(iimg)%mask)
+             allocate(imgA(iimg)%wc(imgA(iimg)%n))
+             imgA(iimg)%wc = pack(wyt,imgA(iimg)%mask)
+             deallocate(wyt)
+          else
+             imgA(iimg)%mask = (idg1 == k)
+             imgA(iimg)%n = count(imgA(iimg)%mask)
+             allocate(imgA(iimg)%wc(imgA(iimg)%n))
+             imgA(iimg)%wc = 1d0
+          end if
+       end do
+       do iimg = 1, nBimg
+          if (iimg == 1) then
+             k = idB
+          else
+             k = 0
+             do i = bas%nattr+1, nattn
+                if (iatt(i) == idB .and. all(ilvec(:,i) == imgB(iimg)%ilvec)) then
+                   k = i
+                   exit
+                end if
+             end do
+          end if
+          if (useyt) then
+             allocate(wyt(n1,n2,n3))
+             call yt_weights(din=dat,idb=idB,w=wyt)
+             allocate(imgB(iimg)%mask(n1,n2,n3))
+             imgB(iimg)%mask = .false.
+             do i3 = 1, n3
+                do i2 = 1, n2
+                   do i1 = 1, n1
+                      if (abs(wyt(i1,i2,i3)) < 1d-15) cycle
+                      ptmp = (/i1,i2,i3/)
+                      xtmp = real(ptmp-1,8)/(/real(n1,8),real(n2,8),real(n3,8)/) - bas%xattr(:,idB)
+                      xmi = xtmp
+                      call sy%c%shortest(xmi,dA)
+                      ptmp = nint(xtmp - sy%c%c2x(xmi))
+                      imgB(iimg)%mask(i1,i2,i3) = all(ptmp == imgB(iimg)%ilvec)
+                   end do
+                end do
+             end do
+             imgB(iimg)%n = count(imgB(iimg)%mask)
+             allocate(imgB(iimg)%wc(imgB(iimg)%n))
+             imgB(iimg)%wc = pack(wyt,imgB(iimg)%mask)
+             deallocate(wyt)
+          else
+             imgB(iimg)%mask = (idg1 == k)
+             imgB(iimg)%n = count(imgB(iimg)%mask)
+             allocate(imgB(iimg)%wc(imgB(iimg)%n))
+             imgB(iimg)%wc = 1d0
+          end if
+       end do
+       do iimg = 1, nAimg
+          write (uout,'("  DIAGNOSTIC imgA(",A,") ilvec=",3(A," ")," n=",A," sum(wc)*domega=",A)')&
+             string(iimg),(string(imgA(iimg)%ilvec(j)),j=1,3), string(imgA(iimg)%n),&
+             string(sum(imgA(iimg)%wc)*domega,'f',8,4)
+       end do
+       do iimg = 1, nBimg
+          write (uout,'("  DIAGNOSTIC imgB(",A,") ilvec=",3(A," ")," n=",A," sum(wc)*domega=",A)')&
+             string(iimg),(string(imgB(iimg)%ilvec(j)),j=1,3), string(imgB(iimg)%n),&
+             string(sum(imgB(iimg)%wc)*domega,'f',8,4)
+       end do
     end if
+
     allocate(wa(n1,n2,n3))
     do is = 1, nspin
        if (nspin == 1) then
@@ -3910,17 +4089,74 @@ contains
              end do
           end do
 
-          write (uout,'("  Spin ",A,": building ",A," psink (band,k-point) orbitals on the grid...")')&
-             string(is), string(nmo)
-          allocate(w2a(nA,nmo),w2aw(nA,nmo),w2b(nB,nmo),w2bw(nB,nmo))
+          write (uout,'("  Spin ",A,": building ",A," psink (band,k-point) orbitals x ",A," image(s) on the grid...")')&
+             string(is), string(nmo), string(nAimg+nBimg)
+          do iimg = 1, nAimg
+             allocate(imgA(iimg)%w(imgA(iimg)%n,nmo))
+          end do
+          do iimg = 1, nBimg
+             allocate(imgB(iimg)%w(imgB(iimg)%n,nmo))
+          end do
           do imo = 1, nmo
              call sy%f(fid)%grid%get_qe_psink_standalone(sy%c%omega,mobnd(imo),moik(imo),is,.true.,&
                 (/0,0,0/),wa)
              wa = wa * occwt(imo)
-             w2a(:,imo) = pack(wa,maskA)
-             w2b(:,imo) = pack(wa,maskB)
-             w2aw(:,imo) = w2a(:,imo) * wAc
-             w2bw(:,imo) = w2b(:,imo) * wBc
+             do iimg = 1, nAimg
+                imgA(iimg)%w(:,imo) = pack(wa,imgA(iimg)%mask)
+             end do
+             do iimg = 1, nBimg
+                imgB(iimg)%w(:,imo) = pack(wa,imgB(iimg)%mask)
+             end do
+          end do
+
+          ! Per image: fold in the image-translation phase, then build its
+          ! own overlap matrix and accumulate. Unlike Wannier functions,
+          ! raw Bloch states do not automatically encode translation by a
+          ! lattice vector R -- summing a basin image at R requires an
+          ! explicit exp(i*(k1-k2).R) correction per (imo1,imo2) matrix
+          ! element (calc_sij_psink's kdif*ilvec(i) factor, see
+          ! integration@proc.f90). That correction factors exactly into a
+          ! per-ORBITAL phase exp(-i*k_imo.R) applied before the matmul (a
+          ! plain conj(W)^T.W product then reproduces
+          ! conj(phase(imo1))*phase(imo2) = exp(+i*(k1-k2).R) automatically
+          ! -- no per-grid-point correction is needed separately, since
+          ! get_qe_psink_standalone's usephase=.true. already returns the
+          ! full Bloch state e^{ikr}u_k(r), which is the algebraically
+          ! equivalent route to calc_sij_psink's u_k(r)-plus-explicit-
+          ! kdif.r correction). No shift/fold of the (imo1,imo2) INDICES
+          ! themselves is needed either (unlike Wannier's (band,translation)
+          ! basis, PSINK's (band,k-point) basis has no periodic folding to
+          ! undo).
+          allocate(satot(nmo,nmo),sbtot(nmo,nmo))
+          satot = 0d0
+          sbtot = 0d0
+          do iimg = 1, nAimg
+             if (any(imgA(iimg)%ilvec /= 0)) then
+                do imo = 1, nmo
+                   pphase = exp(-tpi*img*dot_product(sy%f(fid)%grid%qe%kpt(:,moik(imo)),&
+                      real(imgA(iimg)%ilvec,8)))
+                   imgA(iimg)%w(:,imo) = imgA(iimg)%w(:,imo) * pphase
+                end do
+             end if
+             allocate(imgA(iimg)%s(nmo,nmo))
+             imgA(iimg)%s = matmul(transpose(conjg(imgA(iimg)%w)),&
+                imgA(iimg)%w * spread(imgA(iimg)%wc,2,nmo)) * domega
+             satot = satot + imgA(iimg)%s
+             deallocate(imgA(iimg)%w,imgA(iimg)%s)
+          end do
+          do iimg = 1, nBimg
+             if (any(imgB(iimg)%ilvec /= 0)) then
+                do imo = 1, nmo
+                   pphase = exp(-tpi*img*dot_product(sy%f(fid)%grid%qe%kpt(:,moik(imo)),&
+                      real(imgB(iimg)%ilvec,8)))
+                   imgB(iimg)%w(:,imo) = imgB(iimg)%w(:,imo) * pphase
+                end do
+             end if
+             allocate(imgB(iimg)%s(nmo,nmo))
+             imgB(iimg)%s = matmul(transpose(conjg(imgB(iimg)%w)),&
+                imgB(iimg)%w * spread(imgB(iimg)%wc,2,nmo)) * domega
+             sbtot = sbtot + imgB(iimg)%s
+             deallocate(imgB(iimg)%w,imgB(iimg)%s)
           end do
        else
           if (allocated(bandlist)) then
@@ -3932,101 +4168,177 @@ contains
           else
              nbo = sy%f(fid)%grid%qe%nbndw(is)
           end if
+          ! The orbital basis itself is ALWAYS the full, exact [0,nwan)
+          ! domain -- WANCUT does NOT decide which orbitals exist (that
+          ! would wrongly change nmo/basis completeness). It instead prunes
+          ! individual Sa(i,j)/Sb(i,j) MATRIX ELEMENTS below, by
+          ! orbital-to-orbital proximity, exactly mirroring
+          ! calc_sij_wannier's lovrlp mask -- see the comment there.
+          nmo = nbo * nwan(1) * nwan(2) * nwan(3)
+          allocate(mobnd(nmo),movec(3,nmo))
+          imo = 0
+          do ibx = 1, nbo
+             if (allocated(bandlist)) then
+                ib = bandlist(ibx)
+             else
+                ib = ibx
+             end if
+             do m1 = 0, nwan(1)-1
+                do m2 = 0, nwan(2)-1
+                   do m3 = 0, nwan(3)-1
+                      imo = imo + 1
+                      mobnd(imo) = ib
+                      mc = (/m1,m2,m3/)
+                      movec(:,imo) = mc - nwan*nint(real(mc,8)/real(nwan,8))
+                   end do
+                end do
+             end do
+          end do
+
+          ! Pairwise WANCUT keep-mask: a property of the (imo,jmo) orbital
+          ! pair alone, independent of which atom image is being
+          ! processed, so computed once and reused for every image. This
+          ! must be applied to each image's RAW matrix BEFORE it is
+          ! shift-accumulated (not to the combined total afterwards) --
+          ! exactly mirroring calc_sij_wannier's lovrlp, which prunes the
+          ! raw (imo,jmo) pair before packidx-remapping it per attractor.
+          allocate(keepmask(nmo,nmo))
+          keepmask = .true.
           if (wancut > 0d0) then
-             ! Adaptive: BOX is still the outer enumeration bound (so the
-             ! search stays finite and user-controlled), but a candidate
-             ! (band,translation) is only kept if its Wannier centre is
-             ! within spread*wancut of basin A or B -- exactly the
-             ! criterion calc_sij_wannier uses internally. Distance-only
-             ! checks are cheap; this lets a much bigger BOX be given
-             ! affordably, since only the pairs plausibly overlapping A or
-             ! B ever reach the expensive get_qe_wnr_standalone call below.
-             ! Two passes: count first (to size mobnd/movec exactly), then
-             ! fill.
-             nmo = 0
-             do ibx = 1, nbo
-                if (allocated(bandlist)) then
-                   ib = bandlist(ibx)
-                else
-                   ib = ibx
-                end if
-                spr = sy%f(fid)%grid%qe%spread(ib,is)
-                do m1 = -box(1), box(1)
-                   do m2 = -box(2), box(2)
-                      do m3 = -box(3), box(3)
-                         xc = sy%c%x2c(sy%f(fid)%grid%qe%center(:,ib,is) + real((/m1,m2,m3/),8))
-                         dA = norm2(xc-xA)
-                         dB = norm2(xc-xB)
-                         if (spr*wancut > min(dA,dB)) nmo = nmo + 1
-                      end do
-                   end do
+             nkeptpair = 0
+             do i = 1, nmo
+                do j = 1, nmo
+                   xmi = (sy%f(fid)%grid%qe%center(:,mobnd(i),is) + real(movec(:,i),8) -&
+                      sy%f(fid)%grid%qe%center(:,mobnd(j),is) - real(movec(:,j),8)) / real(nwan,8)
+                   call nc%shortest(xmi,dA)
+                   spr = sy%f(fid)%grid%qe%spread(mobnd(i),is) + sy%f(fid)%grid%qe%spread(mobnd(j),is)
+                   if (spr*wancut <= dA) then
+                      keepmask(i,j) = .false.
+                   else
+                      nkeptpair = nkeptpair + 1
+                   end if
                 end do
              end do
-             allocate(mobnd(nmo),movec(3,nmo))
-             imo = 0
-             do ibx = 1, nbo
-                if (allocated(bandlist)) then
-                   ib = bandlist(ibx)
-                else
-                   ib = ibx
-                end if
-                spr = sy%f(fid)%grid%qe%spread(ib,is)
-                do m1 = -box(1), box(1)
-                   do m2 = -box(2), box(2)
-                      do m3 = -box(3), box(3)
-                         xc = sy%c%x2c(sy%f(fid)%grid%qe%center(:,ib,is) + real((/m1,m2,m3/),8))
-                         dA = norm2(xc-xA)
-                         dB = norm2(xc-xB)
-                         if (spr*wancut > min(dA,dB)) then
-                            imo = imo + 1
-                            mobnd(imo) = ib
-                            movec(:,imo) = (/m1,m2,m3/)
-                         end if
-                      end do
-                   end do
-                end do
-             end do
-             write (uout,'("  WANCUT kept ",A," of ",A," candidate (band,translation) orbitals")')&
-                string(nmo), string(nbo*(2*box(1)+1)*(2*box(2)+1)*(2*box(3)+1))
-          else
-             nmo = nbo * (2*box(1)+1) * (2*box(2)+1) * (2*box(3)+1)
-             allocate(mobnd(nmo),movec(3,nmo))
-             imo = 0
-             do ibx = 1, nbo
-                if (allocated(bandlist)) then
-                   ib = bandlist(ibx)
-                else
-                   ib = ibx
-                end if
-                do m1 = -box(1), box(1)
-                   do m2 = -box(2), box(2)
-                      do m3 = -box(3), box(3)
-                         imo = imo + 1
-                         mobnd(imo) = ib
-                         movec(:,imo) = (/m1,m2,m3/)
-                      end do
-                   end do
-                end do
-             end do
+             write (uout,'("  WANCUT kept ",A," of ",A," (orbital,orbital) overlap matrix elements")')&
+                string(nkeptpair), string(nmo*nmo)
           end if
 
-          ! Build every Wannier orbital on the grid ONE AT A TIME (a full grid
-          ! for all nmo orbitals at once does not fit in memory for anything
-          ! beyond toy systems -- e.g. nbnd=50, a 180^3-ish grid and a 3x3x3
-          ! search box is already > 100 GB), keeping only the compact values
-          ! at the two basins (w2a, w2b), which are what S^A, S^B need. Every
-          ! band here is implicitly weighted 1.0 (i.e. occ=fspin, matching
-          ! the insulator-only assumption behind nbndw) -- see PSINK for the
-          ! general, occupation-weighted case.
-          write (uout,'("  Spin ",A,": building ",A," Wannier orbitals on the grid...")') string(is), string(nmo)
-          allocate(w2a(nA,nmo),w2aw(nA,nmo),w2b(nB,nmo),w2bw(nB,nmo))
-          do imo = 1, nmo
-             call sy%f(fid)%grid%get_qe_wnr_standalone(sy%c%omega,mobnd(imo),is,movec(:,imo),rotate,wa)
-             w2a(:,imo) = pack(wa,maskA)
-             w2b(:,imo) = pack(wa,maskB)
-             w2aw(:,imo) = w2a(:,imo) * wAc
-             w2bw(:,imo) = w2b(:,imo) * wBc
+          ! Build every image's packed orbitals in ONE pass over the bands
+          ! (the expensive get_qe_wnr FFT/rotation is done once per band,
+          ! reused across every image of A and B -- not once per image).
+          do iimg = 1, nAimg
+             allocate(imgA(iimg)%w(imgA(iimg)%n,nmo))
           end do
+          do iimg = 1, nBimg
+             allocate(imgB(iimg)%w(imgB(iimg)%n,nmo))
+          end do
+          write (uout,'("  Spin ",A,": building ",A," Wannier orbitals x ",A," image(s) on the grid...")')&
+             string(is), string(nmo), string(nAimg+nBimg)
+          allocate(f1(n1,n2,n3,nwan(1)*nwan(2)*nwan(3)))
+          ibcur = -1
+          do imo = 1, nmo
+             if (mobnd(imo) /= ibcur) then
+                ibcur = mobnd(imo)
+                call sy%f(fid)%grid%get_qe_wnr(sy%c%omega,ibcur,is,luevc,luevc_ibnd,f1)
+             end if
+             mc = modulo(movec(:,imo),nwan)
+             ilat = 1 + mc(3) + nwan(3)*(mc(2) + nwan(2)*mc(1))
+             do iimg = 1, nAimg
+                imgA(iimg)%w(:,imo) = pack(f1(:,:,:,ilat),imgA(iimg)%mask)
+             end do
+             do iimg = 1, nBimg
+                imgB(iimg)%w(:,imo) = pack(f1(:,:,:,ilat),imgB(iimg)%mask)
+             end do
+          end do
+          deallocate(f1)
+
+          ! Per image: build its own (pruned) overlap matrix, then
+          ! shift-and-accumulate it into the combined satot/sbtot --
+          ! exactly calc_sij_wannier's per-attractor-image accumulation
+          ! via packidx. The shift target for orbital index i (band ibx,
+          ! canonical translation (m1,m2,m3), recovered directly from i
+          ! using the KNOWN, deterministic enumeration order imo =
+          ! (ibx-1)*ntt + lin(m1,m2,m3) + 1) is (m1,m2,m3)-ilvec, wrapped
+          ! into [0,nwan) -- same "S(imo) translated by R is S(imap(imo))"
+          ! identity documented in integration@proc.f90's
+          ! find_sij_translations.
+          ntt = nwan(1)*nwan(2)*nwan(3)
+          allocate(satot(nmo,nmo),sbtot(nmo,nmo),shiftidx(nmo))
+          satot = 0d0
+          sbtot = 0d0
+          do iimg = 1, nAimg
+             allocate(imgA(iimg)%s(nmo,nmo))
+             imgA(iimg)%s = matmul(transpose(conjg(imgA(iimg)%w)),&
+                imgA(iimg)%w * spread(imgA(iimg)%wc,2,nmo)) * domega
+             where (.not.keepmask) imgA(iimg)%s = 0d0
+             do i = 1, nmo
+                ibx = (i-1)/ntt + 1
+                irem = mod(i-1,ntt)
+                m3 = mod(irem,nwan(3))
+                m2 = mod(irem/nwan(3),nwan(2))
+                m1 = irem/(nwan(3)*nwan(2))
+                ish = modulo((/m1,m2,m3/) - imgA(iimg)%ilvec,nwan)
+                shiftidx(i) = (ibx-1)*ntt + ish(1)*nwan(2)*nwan(3) + ish(2)*nwan(3) + ish(3) + 1
+             end do
+             do i = 1, nmo
+                do j = 1, nmo
+                   satot(shiftidx(i),shiftidx(j)) = satot(shiftidx(i),shiftidx(j)) + imgA(iimg)%s(i,j)
+                end do
+             end do
+             deallocate(imgA(iimg)%w,imgA(iimg)%s)
+          end do
+          do iimg = 1, nBimg
+             allocate(imgB(iimg)%s(nmo,nmo))
+             imgB(iimg)%s = matmul(transpose(conjg(imgB(iimg)%w)),&
+                imgB(iimg)%w * spread(imgB(iimg)%wc,2,nmo)) * domega
+             where (.not.keepmask) imgB(iimg)%s = 0d0
+             do i = 1, nmo
+                ibx = (i-1)/ntt + 1
+                irem = mod(i-1,ntt)
+                m3 = mod(irem,nwan(3))
+                m2 = mod(irem/nwan(3),nwan(2))
+                m1 = irem/(nwan(3)*nwan(2))
+                ish = modulo((/m1,m2,m3/) - imgB(iimg)%ilvec,nwan)
+                shiftidx(i) = (ibx-1)*ntt + ish(1)*nwan(2)*nwan(3) + ish(2)*nwan(3) + ish(3) + 1
+             end do
+             do i = 1, nmo
+                do j = 1, nmo
+                   sbtot(shiftidx(i),shiftidx(j)) = sbtot(shiftidx(i),shiftidx(j)) + imgB(iimg)%s(i,j)
+                end do
+             end do
+             deallocate(imgB(iimg)%w,imgB(iimg)%s)
+          end do
+
+          ! Extract the SPECIFIC requested ivecA/ivecB slice from the
+          ! now-complete per-atom tensors, exactly as calc_fa_wannier does
+          ! with sij_wnr_imap(imo,rat_b): Fa uses Sb(imap(imo),imap(jmo))
+          ! where imap shifts the (band,translation) index by -R (wrapped
+          ! into [0,nwan)), R being the requested lattice vector. Without
+          ! this the result is independent of ivecB (it always equals the
+          ! ivec=0 value). A no-op when ivecA/ivecB are zero.
+          do k = 1, 2
+             if (k == 1) then
+                ish = ivecA
+             else
+                ish = ivecB
+             end if
+             if (all(ish == 0)) cycle
+             do i = 1, nmo
+                ibx = (i-1)/ntt + 1
+                irem = mod(i-1,ntt)
+                m3 = mod(irem,nwan(3))
+                m2 = mod(irem/nwan(3),nwan(2))
+                m1 = irem/(nwan(3)*nwan(2))
+                mc = modulo((/m1,m2,m3/) - ish,nwan)
+                shiftidx(i) = (ibx-1)*ntt + mc(1)*nwan(2)*nwan(3) + mc(2)*nwan(3) + mc(3) + 1
+             end do
+             if (k == 1) then
+                satot = satot(shiftidx,shiftidx)
+             else
+                sbtot = sbtot(shiftidx,shiftidx)
+             end if
+          end do
+          deallocate(keepmask,shiftidx)
        end if
 
        ! Sa(i,j) = sum_r wA(r) * conjg(orb_i(r)) * orb_j(r) -- the basin
@@ -4034,12 +4346,52 @@ contains
        ! side of the product, not squared; the occupation weight (PSINK
        ! only, folded into orb_i/orb_j themselves as sqrt(occ/fspin)) is
        ! therefore also applied once per orbital, twice per matrix element,
-       ! as it should be
+       ! as it should be. Both branches now build satot/sbtot the same way
+       ! (image-accumulated, and for Wannier also WANCUT-pruned) above.
        allocate(sa(nmo,nmo),sb(nmo,nmo),gab(nmo,nmo),eval(nmo))
-       sa = matmul(transpose(conjg(w2a)),w2aw) * domega
-       sb = matmul(transpose(conjg(w2b)),w2bw) * domega
+       sa = satot
+       sb = sbtot
+       deallocate(satot,sbtot)
+       if (usepsink) then
+          ! calc_fa_psink extracts the SPECIFIC requested ivecA/ivecB slice
+          ! from the (already-complete, multi-image-summed) sa/sb tensors
+          ! via an ADDITIONAL diagonal-unitary phase correction per side (a
+          ! k-dependent phase exp(2*pi*i*k_imo.ivec), applied as a
+          ! row/column similarity transform: Diag(D).S.Diag(D)^dagger).
+          ! This is NOT the same as the per-image ilvec phase already
+          ! folded in above (that one only makes sa/sb internally
+          ! consistent/complete, matching calc_sij_psink); this one
+          ! selects which relative A-B geometry to actually report,
+          ! matching calc_fa_psink's kdif.(ia,ja,ka) factor exactly
+          ! (integration@proc.f90). A no-op whenever ivecA/ivecB is zero.
+          do imo = 1, nmo
+             ! sign: the true translated-basin overlap is
+             ! S^{X+R}(a,b) = e^{i(k_b-k_a).R} S^X(a,b) (Bloch periodicity),
+             ! i.e. conjg(D_a) S D_b with D=e^{i k.R}; calc_fa_psink's
+             ! sum reproduces Tr[S^A S^{B+R}] with exactly this factor
+             pphase = exp(-tpi*img*dot_product(sy%f(fid)%grid%qe%kpt(:,moik(imo)),real(ivecA,8)))
+             sa(imo,:) = sa(imo,:) * pphase
+             sa(:,imo) = sa(:,imo) * conjg(pphase)
+             pphase = exp(-tpi*img*dot_product(sy%f(fid)%grid%qe%kpt(:,moik(imo)),real(ivecB,8)))
+             sb(imo,:) = sb(imo,:) * pphase
+             sb(:,imo) = sb(:,imo) * conjg(pphase)
+          end do
+       end if
+       trA = 0d0
+       trB = 0d0
+       do i = 1, nmo
+          trA = trA + real(sa(i,i),8)
+          trB = trB + real(sb(i,i),8)
+       end do
+       write (uout,'("  DIAGNOSTIC Tr[Sa]*fspin (basin A pop. seen by this basis): ",A)') string(trA*fspin,'f',10,6)
+       write (uout,'("  DIAGNOSTIC Tr[Sb]*fspin (basin B pop. seen by this basis): ",A)') string(trB*fspin,'f',10,6)
        gab = 0.5d0 * (matmul(sa,sb) + matmul(sb,sa))
-       deallocate(w2a,w2aw,w2b,w2bw,sa,sb)
+       trA = 0d0
+       do i = 1, nmo
+          trA = trA + real(gab(i,i),8)
+       end do
+       write (uout,'("  DIAGNOSTIC Tr[gab]*fspin, direct (before eigherm): ",A)') string(trA*fspin,'f',10,6)
+       deallocate(sa,sb)
 
        call eigherm(gab,nmo,eval)
 
@@ -4112,7 +4464,7 @@ contains
           do imo = 1, nmo
              if (usepsink) then
                 call sy%f(fid)%grid%get_qe_psink_standalone(sy%c%omega,mobnd(imo),moik(imo),is,.true.,&
-                   (/0,0,0/),wbig)
+                   (/0,0,0/),wbig,ioffset=-superbox)
                 wbig = wbig * occwt(imo)
              else
                 call sy%f(fid)%grid%get_qe_wnr_standalone(sy%c%omega,mobnd(imo),is,movec(:,imo),rotate,wbig,&
@@ -4190,7 +4542,11 @@ contains
     else
        deallocate(idg1)
     end if
-    deallocate(wa,bas%f,ilvec,iatt,maskA,maskB,wAc,wBc)
+    if (.not.usepsink) then
+       if (luevc(1) >= 0) call fclose(luevc(1))
+       if (luevc(2) >= 0) call fclose(luevc(2))
+    end if
+    deallocate(wa,bas%f,ilvec,iatt)
 
   end subroutine trick_nados
 
@@ -4247,5 +4603,209 @@ contains
     deallocate(wa)
 
   end subroutine trick_psinknorm
+
+  !> TRICK WNRORTHO fieldid ibnd1 m1a m2a m3a ibnd2 m1b m2b m3b ispin [NOROTATE]
+  !>
+  !> Diagnostic: builds two Wannier orbitals (band ibnd1 at translation
+  !> (m1a,m2a,m3a), band ibnd2 at translation (m1b,m2b,m3b)) via
+  !> get_qe_wnr_standalone and reports their FULL-CELL (unrestricted, no
+  !> basin mask) inner product. For a correct Wannier construction this
+  !> must be 1+0i when the two are identical and 0+0i otherwise (bands
+  !> and/or translations differ) -- the underlying assumption the whole
+  !> DI/NAdOcc trace identity (Tr[S^A S^B] = Fa) depends on.
+  subroutine trick_wnrortho(line0)
+    use tools_io, only: getword, isinteger, ferror, faterr, uout, string
+    use systemmod, only: sy
+    use fieldmod, only: type_grid
+    character*(*), intent(in) :: line0
+
+    character(len=:), allocatable :: word
+    integer :: lp, fid, ibnd1, ibnd2, ispin, mveca(3), mvecb(3), n1, n2, n3, ntot
+    logical :: ok, rotate
+    real*8 :: domega
+    complex*16 :: xip
+    complex*16, allocatable :: wa(:,:,:), wb(:,:,:)
+
+    lp = 1
+    word = getword(line0,lp)
+    fid = sy%fieldname_to_idx(word)
+    ok = isinteger(ibnd1,line0,lp)
+    ok = ok .and. isinteger(mveca(1),line0,lp)
+    ok = ok .and. isinteger(mveca(2),line0,lp)
+    ok = ok .and. isinteger(mveca(3),line0,lp)
+    ok = ok .and. isinteger(ibnd2,line0,lp)
+    ok = ok .and. isinteger(mvecb(1),line0,lp)
+    ok = ok .and. isinteger(mvecb(2),line0,lp)
+    ok = ok .and. isinteger(mvecb(3),line0,lp)
+    ok = ok .and. isinteger(ispin,line0,lp)
+    if (.not.ok) then
+       call ferror('trick_wnrortho','Error: syntax is WNRORTHO fieldid ibnd1 m1a m2a m3a ibnd2 m1b m2b m3b ispin',faterr)
+       return
+    end if
+    rotate = .true.
+    word = getword(line0,lp)
+    if (len_trim(word) > 0) then
+       if (word(1:2) == 'no' .or. word(1:2) == 'NO') rotate = .false.
+    end if
+
+    if (.not.sy%goodfield(fid)) then
+       call ferror('trick_wnrortho','Error: FIELD not initialized',faterr)
+       return
+    end if
+    if (sy%f(fid)%type /= type_grid) then
+       call ferror('trick_wnrortho','Error: FIELD is not a grid',faterr)
+       return
+    end if
+
+    n1 = sy%f(fid)%grid%n(1)
+    n2 = sy%f(fid)%grid%n(2)
+    n3 = sy%f(fid)%grid%n(3)
+    ntot = n1*n2*n3
+    domega = sy%c%omega / real(ntot,8)
+
+    allocate(wa(n1,n2,n3),wb(n1,n2,n3))
+    call sy%f(fid)%grid%get_qe_wnr_standalone(sy%c%omega,ibnd1,ispin,mveca,rotate,wa)
+    call sy%f(fid)%grid%get_qe_wnr_standalone(sy%c%omega,ibnd2,ispin,mvecb,rotate,wb)
+    xip = sum(conjg(wa)*wb) * domega
+    write (uout,'("  <(",A,",",A,",",A,",",A,")|(",A,",",A,",",A,",",A,")>: Re=",A," Im=",A," |.|=",A)')&
+       string(ibnd1),string(mveca(1)),string(mveca(2)),string(mveca(3)),&
+       string(ibnd2),string(mvecb(1)),string(mvecb(2)),string(mvecb(3)),&
+       string(real(xip,8),'f',14,8), string(aimag(xip),'f',14,8), string(abs(xip),'f',14,8)
+    deallocate(wa,wb)
+
+  end subroutine trick_wnrortho
+
+  !> TRICK DENSCHECK fieldid ispin i j k
+  !>
+  !> Diagnostic: sums fspin*|phi_(ib,R)(r)|^2 over EVERY band and EVERY
+  !> translation in the exact k-mesh domain (the same nbndw(is)*nk domain
+  !> trick_nados uses with WANCUT off), evaluated at one grid point (i,j,k),
+  !> and reports it. This must equal the valence-only density at that grid
+  !> point (e.g. from a plain SCF density cube such as rho.cube) if the
+  !> orbital set is a genuine resolution of the identity -- a basin-mask-
+  !> independent, pre-DI sanity check on the orbital construction itself.
+  subroutine trick_denscheck(line0)
+    use tools_io, only: getword, isinteger, ferror, faterr, uout, string, fclose
+    use systemmod, only: sy
+    use fieldmod, only: type_grid
+    character*(*), intent(in) :: line0
+
+    character(len=:), allocatable :: word
+    integer :: lp, fid, ispin, i0, j0, k0, n1, n2, n3, nwan(3), nbo, ib, ilat
+    integer :: luevc(2), luevc_ibnd(2)
+    logical :: ok
+    real*8 :: fspin, xsum
+    complex*16, allocatable :: f1(:,:,:,:)
+
+    lp = 1
+    word = getword(line0,lp)
+    fid = sy%fieldname_to_idx(word)
+    ok = isinteger(ispin,line0,lp)
+    ok = ok .and. isinteger(i0,line0,lp)
+    ok = ok .and. isinteger(j0,line0,lp)
+    ok = ok .and. isinteger(k0,line0,lp)
+    if (.not.ok) then
+       call ferror('trick_denscheck','Error: syntax is DENSCHECK fieldid ispin i j k',faterr)
+       return
+    end if
+
+    if (.not.sy%goodfield(fid)) then
+       call ferror('trick_denscheck','Error: FIELD not initialized',faterr)
+       return
+    end if
+    if (sy%f(fid)%type /= type_grid) then
+       call ferror('trick_denscheck','Error: FIELD is not a grid',faterr)
+       return
+    end if
+
+    n1 = sy%f(fid)%grid%n(1)
+    n2 = sy%f(fid)%grid%n(2)
+    n3 = sy%f(fid)%grid%n(3)
+    nwan = sy%f(fid)%grid%qe%nk
+    nbo = sy%f(fid)%grid%qe%nbndw(ispin)
+    if (sy%f(fid)%grid%qe%nspin == 1) then
+       fspin = 2d0
+    else
+       fspin = 1d0
+    end if
+
+    call sy%f(fid)%grid%rotate_qe_evc(luevc,luevc_ibnd,.true.)
+    allocate(f1(n1,n2,n3,nwan(1)*nwan(2)*nwan(3)))
+    xsum = 0d0
+    do ib = 1, nbo
+       call sy%f(fid)%grid%get_qe_wnr(sy%c%omega,ib,ispin,luevc,luevc_ibnd,f1)
+       do ilat = 1, nwan(1)*nwan(2)*nwan(3)
+          xsum = xsum + abs(f1(i0,j0,k0,ilat))**2
+       end do
+    end do
+    xsum = xsum * fspin
+    deallocate(f1)
+    if (luevc(1) >= 0) call fclose(luevc(1))
+    if (luevc(2) >= 0) call fclose(luevc(2))
+
+    write (uout,'("  fspin*sum|phi_(ib,R)(",A,",",A,",",A,")|^2 over full nk-domain: ",A)')&
+       string(i0), string(j0), string(k0), string(xsum,'f',14,8)
+
+  end subroutine trick_denscheck
+
+  !> TRICK UMATCHECK fieldid ik ispin
+  !>
+  !> Diagnostic: reads the num_wann x num_wann u-matrix U(k) for k-point ik
+  !> (as read from the .chk file into qe%u) and checks whether U(k) is
+  !> unitary (U^dagger U = I), which is the ONLY condition Wannier
+  !> orthonormality (and hence the whole DI trace identity) actually
+  !> depends on -- a cheap, purely-algebraic check with no grid/FFT work.
+  subroutine trick_umatcheck(line0)
+    use tools_io, only: getword, isinteger, ferror, faterr, uout, string
+    use systemmod, only: sy
+    use fieldmod, only: type_grid
+    character*(*), intent(in) :: line0
+
+    character(len=:), allocatable :: word
+    integer :: lp, fid, ik, ispin, nw, i, j, k
+    logical :: ok
+    complex*16, allocatable :: uu(:,:), udu(:,:)
+    real*8 :: maxoff, maxdiag
+
+    lp = 1
+    word = getword(line0,lp)
+    fid = sy%fieldname_to_idx(word)
+    ok = isinteger(ik,line0,lp)
+    ok = ok .and. isinteger(ispin,line0,lp)
+    if (.not.ok) then
+       call ferror('trick_umatcheck','Error: syntax is UMATCHECK fieldid ik ispin',faterr)
+       return
+    end if
+
+    if (.not.sy%goodfield(fid)) then
+       call ferror('trick_umatcheck','Error: FIELD not initialized',faterr)
+       return
+    end if
+    if (sy%f(fid)%type /= type_grid) then
+       call ferror('trick_umatcheck','Error: FIELD is not a grid',faterr)
+       return
+    end if
+
+    nw = sy%f(fid)%grid%qe%nbndw(ispin)
+    allocate(uu(nw,nw),udu(nw,nw))
+    uu = sy%f(fid)%grid%qe%u(1:nw,1:nw,ik,ispin)
+    udu = matmul(transpose(conjg(uu)),uu)
+
+    maxoff = 0d0
+    maxdiag = 0d0
+    do i = 1, nw
+       do j = 1, nw
+          if (i == j) then
+             maxdiag = max(maxdiag,abs(abs(udu(i,i))-1d0))
+          else
+             maxoff = max(maxoff,abs(udu(i,j)))
+          end if
+       end do
+    end do
+    write (uout,'("  U(k=",A,",spin=",A,") is ",A,"x",A,". max|diag(U^+U)-1|=",A," max|offdiag(U^+U)|=",A)')&
+       string(ik), string(ispin), string(nw), string(nw), string(maxdiag,'e',12,4), string(maxoff,'e',12,4)
+    deallocate(uu,udu)
+
+  end subroutine trick_umatcheck
 
 end module tricks

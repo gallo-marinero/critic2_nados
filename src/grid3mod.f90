@@ -304,7 +304,7 @@ module grid3mod
        integer, intent(in), optional :: ioffset(3)
        type(thread_info), intent(in), optional :: ti
      end subroutine get_qe_wnr_standalone
-     module subroutine get_qe_psink_standalone(f,omega,ibnd,ik,ispin,usephase,inr,fout,ti)
+     module subroutine get_qe_psink_standalone(f,omega,ibnd,ik,ispin,usephase,inr,fout,ioffset,ti)
        class(grid3), intent(in) :: f
        real*8, intent(in) :: omega
        integer, intent(in) :: ibnd
@@ -313,6 +313,7 @@ module grid3mod
        logical :: usephase
        integer, intent(in) :: inr(3)
        complex*16, intent(out) :: fout(:,:,:)
+       integer, intent(in), optional :: ioffset(3)
        type(thread_info), intent(in), optional :: ti
      end subroutine get_qe_psink_standalone
   end interface

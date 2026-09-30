@@ -2109,7 +2109,7 @@ contains
   !> ik, and spin ispin from QEs Bloch coefficients, standalone
   !> version. Returns the unk(r) in cell grid fout. omega is the cell
   !> volume (used for normalization).
-  module subroutine get_qe_psink_standalone(f,omega,ibnd,ik,ispin,usephase,inr,fout,ti)
+  module subroutine get_qe_psink_standalone(f,omega,ibnd,ik,ispin,usephase,inr,fout,ioffset,ti)
     use tools_io, only: fopen_read, fopen_scratch, fclose, ferror, faterr
     use param, only: tpi, img
     class(grid3), intent(in) :: f
@@ -2120,14 +2120,23 @@ contains
     logical :: usephase
     integer, intent(in) :: inr(3)
     complex*16, intent(out) :: fout(:,:,:)
+    integer, intent(in), optional :: ioffset(3)
     type(thread_info), intent(in), optional :: ti
 
     integer :: i, j, k, is, ik_, jbnd, luc, ireg
-    complex*16, allocatable :: evc(:), evcaux(:), rseq(:)
+    integer :: nout(3), ioff(3), iw, jw, kw
+    complex*16, allocatable :: evc(:), evcaux(:), rseq(:), raux(:,:,:)
 
-    ! some checks
-    if (f%n(1) /= size(fout,1).or.f%n(2) /= size(fout,2).or.f%n(3) /= size(fout,3)) &
-       call ferror("get_qe_psink_standalone","inconsistent grid size",faterr)
+    ! some checks: the output grid may be an integer multiple of the field
+    ! grid (a multi-cell box, positioned by ioffset in units of cells), in
+    ! which case u_k(r) is looked up wrapped (it is periodic) but the
+    ! Bloch phase e(ik*r) uses the true, unwrapped coordinate -- the same
+    ! construction as get_qe_wnr_standalone.
+    nout = (/size(fout,1),size(fout,2),size(fout,3)/)
+    ioff = 0
+    if (present(ioffset)) ioff = ioffset * f%n
+    if (any(mod(nout,f%n) /= 0)) &
+       call ferror("get_qe_psink_standalone","output grid size must be an integer multiple of the field grid",faterr)
 
     ! open the pwc file
     luc = fopen_read(f%qe%fpwc,form="unformatted",ti=ti)
@@ -2159,22 +2168,36 @@ contains
     deallocate(evcaux)
     call fclose(luc)
 
-    ! calculate the unk(r) as FT of the Bloch coefficients
-    allocate(rseq(f%n(1)*f%n(2)*f%n(3)))
+    ! calculate the unk(r) as FT of the Bloch coefficients (one field cell)
+    allocate(rseq(f%n(1)*f%n(2)*f%n(3)),raux(f%n(1),f%n(2),f%n(3)))
     rseq = 0d0
     rseq(f%qe%nl(f%qe%igk_k(1:f%qe%ngk(ik),ik))) = evc(1:f%qe%ngk(ik))
-    fout = reshape(rseq,shape(fout))
-    call cfftnd(3,f%n,+1,fout)
+    raux = reshape(rseq,shape(raux))
+    call cfftnd(3,f%n,+1,raux)
     deallocate(rseq)
 
-    ! the phase factor for this k-point (e(ik*r))
+    ! copy onto the (possibly multi-cell) output grid, wrapping u_k(r)
+    do k = 1, nout(3)
+       kw = modulo(k-1+ioff(3),f%n(3)) + 1
+       do j = 1, nout(2)
+          jw = modulo(j-1+ioff(2),f%n(2)) + 1
+          do i = 1, nout(1)
+             iw = modulo(i-1+ioff(1),f%n(1)) + 1
+             fout(i,j,k) = raux(iw,jw,kw)
+          end do
+       end do
+    end do
+    deallocate(raux)
+
+    ! the phase factor for this k-point (e(ik*r)), on the unwrapped coordinate
     if (usephase) then
-       do k = 1, f%n(3)
-          do j = 1, f%n(2)
-             do i = 1, f%n(1)
-                fout(i,j,k) = fout(i,j,k) * exp(tpi*img*(f%qe%kpt(1,ik)*(real(i-1,8)/real(f%n(1),8))+&
-                   f%qe%kpt(2,ik)*(real(j-1,8)/real(f%n(2),8))+&
-                   f%qe%kpt(3,ik)*(real(k-1,8)/real(f%n(3),8))))
+       do k = 1, nout(3)
+          do j = 1, nout(2)
+             do i = 1, nout(1)
+                fout(i,j,k) = fout(i,j,k) * exp(tpi*img*(&
+                   f%qe%kpt(1,ik)*(real(i-1+ioff(1),8)/real(f%n(1),8))+&
+                   f%qe%kpt(2,ik)*(real(j-1+ioff(2),8)/real(f%n(2),8))+&
+                   f%qe%kpt(3,ik)*(real(k-1+ioff(3),8)/real(f%n(3),8))))
              end do
           end do
        end do
