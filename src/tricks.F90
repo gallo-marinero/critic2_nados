@@ -3591,7 +3591,7 @@ contains
     use bader, only: bader_integrate, bader_remap
     use yt, only: yt_integrate, yt_weights, yt_remap, ytdata, ytdata_clean
     use types, only: basindat, realloc
-    use param, only: img, tpi
+    use param, only: img, tpi, pi
     use crystalmod, only: crystal
     use crystalseedmod, only: crystalseed
     character*(*), intent(in) :: line0
@@ -4510,20 +4510,39 @@ contains
              ! on un-rotated Bloch states, where no single global phase can
              ! fix a per-orbital phase inconsistency).
              zphase = sum(ndc(:,:,:,i)**2)
+             theta = 0d0
              if (abs(zphase) > 0d0) then
                 theta = 0.5d0 * atan2(aimag(zphase),real(zphase,8))
                 ndc(:,:,:,i) = ndc(:,:,:,i) * exp(-img*theta)
              end if
              ximag = sum(abs(aimag(ndc(:,:,:,i))))
-             if (ximag > 1d-3*max(1d0,sum(abs(real(ndc(:,:,:,i),8))))) &
-                call ferror('trick_nados',&
-                   'the discarded imaginary part of this NAdO is not negligible after '//&
-                   'optimal global-phase rotation (genuinely non-real gauge, not just '//&
-                   'an arbitrary overall phase)',warning)
-             nado = real(ndc(:,:,:,i),8)
-
+             write (uout,'("  DIAGNOSTIC NAdO rank ",A,": sum|Im|/sum|Re| = ",A)')&
+                string(keeprank(i)), string(ximag/max(1d0,sum(abs(real(ndc(:,:,:,i),8)))),'e',10,3)
+             ! Imaginary parts below 1e-3 of the local amplitude are rounding
+             ! noise; set them to +0 so atan2 gives exactly 0 or pi there
+             ! instead of flickering between +pi and -pi.
+             where (abs(aimag(ndc(:,:,:,i))) < 1d-3*abs(ndc(:,:,:,i)))
+                ndc(:,:,:,i) = cmplx(real(ndc(:,:,:,i),8),0d0,8)
+             end where
+             ! Write the full complex NAdO (after the same optimal global-
+             ! phase rotation, so "phase" here is measured relative to a
+             ! meaningful, reproducible reference, not an arbitrary one) as
+             ! two same-grid cubes: the original name, now |NAdO| =
+             ! sqrt(Re^2+Im^2) (the isosurface-extraction field -- this
+             ! captures the full complex amplitude, so no information is
+             ! discarded even where the residual imaginary part is locally
+             ! large relative to the real part), and a "_phase" cube
+             ! (the eigenvector's own global phase plus 0 or pi, folded into
+             ! [-pi/2,3pi/2) so the branch cut misses the real lobes) meant
+             ! to directly colour that isosurface.
+             nado = abs(ndc(:,:,:,i))
              call sy%c%writegrid_cube(nado,trim(prefix)//"_s"//string(is)//"_"//trim(sgn)//"_"//&
                 string(keeprank(i))//"_n"//string(eval(j),'f',6,4)//".cube",.false.,.false.,xd0,x00)
+             nado = atan2(aimag(ndc(:,:,:,i)),real(ndc(:,:,:,i),8)) + theta
+             where (nado < -0.5d0*pi) nado = nado + tpi
+             where (nado >= 1.5d0*pi) nado = nado - tpi
+             call sy%c%writegrid_cube(nado,trim(prefix)//"_s"//string(is)//"_"//trim(sgn)//"_"//&
+                string(keeprank(i))//"_n"//string(eval(j),'f',6,4)//"_phase.cube",.false.,.false.,xd0,x00)
           end do
           deallocate(nado,ndc)
        end if
